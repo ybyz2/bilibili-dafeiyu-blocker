@@ -5,3 +5,9 @@ Thumbs.db
 
 # 本地测试
 *.tmp
+
+# 与脚本无关的文件
+*.jpg
+*.jpeg
+*.png
+shipin/
