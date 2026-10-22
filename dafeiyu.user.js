@@ -64,6 +64,7 @@
   var RE_DASH  = /[\u2014\u2015\u2500]|--/;
   var RE_CHAR  = /[鱼鲸]/;
   var RE_PUNCT = /[：；]/;
+  var RE_CORNER = /[「」]/;
 
   function textOf(r) {
     var c = r && r.content;
@@ -92,6 +93,7 @@
     if (RE_CHAR.test(full)) return true;
     if (RE_PUNCT.test(full)) return true;
     if (RE_DASH.test(full)) return true;
+    if (RE_CORNER.test(full)) return true;
     return false;
   }
 
