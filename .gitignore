@@ -1,0 +1,7 @@
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.log
+
+# 本地测试
+*.tmp
