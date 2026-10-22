@@ -1,5 +1,7 @@
 # 屏蔽大肥鱼
 
+<a href="https://github.com/ybyz2/bilibili-dafeiyu-blocker/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/ybyz2/bilibili-dafeiyu-blocker?style=flat-square"></a> <a href="https://github.com/ybyz2/bilibili-dafeiyu-blocker/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/ybyz2/bilibili-dafeiyu-blocker?style=flat-square"></a> <a href="https://github.com/ybyz2/bilibili-dafeiyu-blocker/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/github/license/ybyz2/bilibili-dafeiyu-blocker?style=flat-square"></a>
+
 屏蔽 B站评论区里「大肥鱼」这类 AI 人格账号的油猴脚本。
 
 ## 安装
