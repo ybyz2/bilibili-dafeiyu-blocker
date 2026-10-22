@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         屏蔽大肥鱼
 // @namespace    dafeiyu
-// @version      1.2.0
+// @version      1.3.0
 // @description  屏蔽B站评论区里的大肥鱼
 // @match        https://www.bilibili.com/*
 // @match        https://t.bilibili.com/*
@@ -60,7 +60,7 @@
 
   var RE_NAME  = /鱼|鲸/;
   var RE_BRAND = /大肥鱼|肥鱼|鲸鱼|大肥鲸|鲸鱼娘|本鲸|本鱼|本肥鱼|主人/;
-  var RE_QUOTE = /^回复\s*@[\s\S]{0,24}?\s*[:：]\s*/;
+  var RE_QUOTE = /^回复\s*@[\s\S]{0,40}?\s*[:：]\s*/;
   var RE_DASH  = /[\u2014\u2015\u2500]|--/;
   var RE_CHAR  = /[鱼鲸]/;
   var RE_PUNCT = /[：；]/;
@@ -81,10 +81,11 @@
       if (m) body = full.slice(m[0].length);
     }
 
-    if (tier === 'atonly') return body.indexOf('@') !== -1;
-
+    /* 账号名含鱼/鲸：所有档位一律屏蔽（这条精度 100%，不参与档位取舍） */
     var m = r && r.member;
     if (m && RE_NAME.test(m.uname || m.name || '')) return true;
+
+    if (tier === 'atonly') return body.indexOf('@') !== -1;
 
     if (RE_BRAND.test(full)) return true;
     if (tier === 'cup') return false;
@@ -97,7 +98,71 @@
     return false;
   }
 
-  var removed = 0;
+  /* ============ 已清计数 ============ */
+
+  /*
+   * 只统计「这份评论列表里真正不会出现在页面上的评论」，三条规矩：
+   *   1. 同一个 rpid 只算一次 —— 翻页重叠、切排序、重复展开楼中楼都不会重复计数
+   *   2. 一级评论首屏（换排序 / 换视频 / 刷新）时清零重算，不会一路累加
+   *   3. 只有真的把改过的数据交给页面之后才记数 —— 构造响应失败就不记，
+   *      避免出现「数字涨了但评论还在」
+   *
+   * 一条一级评论命中时，它的楼中楼被整楼带走。接口只给前 2~3 条预览，
+   * 所以楼中楼按 rcount（真实条数）记，不会少算。
+   */
+  var stat = { r: 0, s: 0 };     /* 一级评论 / 楼中楼 */
+  var counted = {};              /* 本轮已计过数的 rpid */
+  var countedN = 0;
+  var COUNT_CAP = 50000;
+
+  function statTotal() { return stat.r + stat.s; }
+
+  function resetCount() {
+    stat.r = 0;
+    stat.s = 0;
+    counted = {};
+    countedN = 0;
+  }
+
+  /* items: [{ id, r, s }]，id 为 null 时不去重 */
+  function commitCount(items) {
+    var k, it, key;
+    for (k = 0; k < items.length; k++) {
+      it = items[k];
+      if (it.id != null) {
+        key = '' + it.id;
+        if (counted[key]) continue;
+        if (countedN >= COUNT_CAP) continue;
+        counted[key] = 1;
+        countedN++;
+      }
+      stat.r += it.r || 0;
+      stat.s += it.s || 0;
+    }
+    drawBanner();
+    /* 单页路由切换后评论区整块重建，banner 会被一起摘掉，这里补插回去 */
+    if (config.showCount && (!bHost || !bHost.isConnected)) watchMount();
+  }
+
+  /*
+   * 首屏请求来了就先按这个列表重算：换排序、换视频、刷新都会重发首屏，
+   * 那时候旧数字已经不属于当前列表了。
+   */
+  function onFirstPage() { resetCount(); }
+
+  /* 真的把改过的数据交给页面之后才结算 */
+  function settle(r) {
+    var mk = r.marks;
+    if (mk) {
+      for (var k = 0; k < mk.length; k++) {
+        if (counted[mk[k]]) continue;
+        if (countedN >= COUNT_CAP) break;
+        counted[mk[k]] = 1;
+        countedN++;
+      }
+    }
+    commitCount(r.items);
+  }
 
   /* ============ 处理接口数据 ============ */
 
@@ -111,29 +176,40 @@
     return 0;   /* add / del / action / subject / report 等一律跳过 */
   }
 
-  function processPayload(json, kind) {
+  /*
+   * 过滤一份接口数据，只做「改数据 + 记账单」，不碰全局计数（交给 settle）。
+   * 返回 null = 这份数据不用管；否则返回 { items }，
+   * items 是被删掉的评论清单（一级 / 楼中楼分开）。
+   */
+  function filterPayload(json, kind) {
     var data = json && json.data;
-    if (!data) return 0;
+    if (!data) return null;
 
     var tier = config.tier;
     var sub = config.sub;
-    var n = 0, kept, i, j, c;
+    var items = [], marks = [], kept, i, j, c, kids, hit, hitKids, k;
 
-    /* 楼中楼接口 */
+    /* ---- 楼中楼接口 ---- */
     if (kind === 2) {
-      if (sub === 'none') return 0;
+      if (sub === 'none') return null;
       var list = data.replies;
-      if (!list || !list.length) return 0;
+      if (!list || !list.length) return null;
       kept = [];
       for (i = 0; i < list.length; i++) {
-        if (isBlocked(list[i], tier)) { n++; continue; }
+        if (isBlocked(list[i], tier)) {
+          items.push({ id: list[i] && list[i].rpid, r: 0, s: 1 });
+          continue;
+        }
         kept.push(list[i]);
       }
-      if (n) data.replies = kept;
-      removed += n;
-      markDirty();
-      return n;
+      if (!items.length) return null;
+      data.replies = kept;
+      return { items: items, marks: null };
     }
+
+    /* ---- 一级评论 ---- */
+    var roots = data.replies;
+    if (!roots || !roots.length) return null;
 
     /* 置顶不处理 */
     var pinned = null;
@@ -149,9 +225,6 @@
       pinned[data.top.upper.rpid] = 1;
     }
 
-    var roots = data.replies;
-    if (!roots || !roots.length) return 0;
-
     kept = [];
     for (i = 0; i < roots.length; i++) {
       c = roots[i];
@@ -159,46 +232,71 @@
       if (pinned && c && pinned[c.rpid]) { kept.push(c); continue; }
 
       var rootHit = isBlocked(c, tier);
-      var kids = c && c.replies;
-      var hasKids = kids && kids.length;
+      kids = (c && c.replies) || [];
+      var hasKids = kids.length > 0;
+      /* 整楼删除时楼中楼全没：接口只给预览，rcount 才是真条数 */
+      var kidTotal = Math.max((c && c.rcount) || 0, kids.length);
 
       if (rootHit) {
-        n += 1 + (hasKids ? kids.length : 0);
+        items.push({ id: c && c.rpid, r: 1, s: kidTotal });
+        /* 预览里这几条楼中楼已经算在 rcount 里了，记个标记避免重复 */
+        for (j = 0; j < kids.length; j++) {
+          if (kids[j] && kids[j].rpid != null) marks.push('' + kids[j].rpid);
+        }
         continue;
       }
 
       if (!hasKids || sub === 'none') { kept.push(c); continue; }
 
-      /* 主楼未命中，看楼中楼 */
-      var hitCount = 0;
+      /* 主楼未命中，看楼中楼（判定只跑一遍，命中列表留着后面用） */
+      hitKids = [];
       for (j = 0; j < kids.length; j++) {
-        if (isBlocked(kids[j], tier)) hitCount++;
+        if (isBlocked(kids[j], tier)) hitKids.push(j);
       }
-
-      if (!hitCount) { kept.push(c); continue; }
+      hit = hitKids.length;
+      if (!hit) { kept.push(c); continue; }
 
       if (sub === 'whole') {
-        n += 1 + kids.length;
+        items.push({ id: c && c.rpid, r: 1, s: Math.max((c && c.rcount) || 0, kids.length) });
+        for (j = 0; j < kids.length; j++) {
+          if (kids[j] && kids[j].rpid != null) marks.push('' + kids[j].rpid);
+        }
         continue;
       }
 
-      /* only：只删命中的楼中楼 */
-      var rest = [];
+      /* only：只删命中的楼中楼，主楼保留 */
+      var rest = [], drop = {};
+      for (k = 0; k < hitKids.length; k++) {
+        j = hitKids[k];
+        drop[j] = 1;
+        items.push({ id: kids[j] && kids[j].rpid, r: 0, s: 1 });
+      }
       for (j = 0; j < kids.length; j++) {
-        if (isBlocked(kids[j], tier)) continue;
-        rest.push(kids[j]);
+        if (!drop[j]) rest.push(kids[j]);
       }
       c.replies = rest;
-      n += hitCount;
+      /* 「共 N 条回复」跟着减，免得点开是空的（空楼） */
+      if (c.rcount) c.rcount = Math.max(0, c.rcount - hit);
       kept.push(c);
     }
 
-    if (n) data.replies = kept;
-    removed += n;
-    markDirty();
-    return n;
+    if (items.length) data.replies = kept;
+
+    return { items: items, marks: marks.length ? marks : null };
   }
 
+  /*
+   * 首屏请求判定：换了排序、换了视频、刷新，都会重新拉第一页。
+   * wbi/main 用 pagination_str={"offset":""}，旧版用 next=0 / pn=1。
+   */
+  function isFirstPageReq(url) {
+    if (!url) return false;
+    var u = url;
+    try { u = decodeURIComponent(url); } catch (e) {}
+    if (u.indexOf('pagination_str') !== -1) return u.indexOf('"offset":""') !== -1;
+    if (!/[?&]next=/.test(u) && !/[?&]pn=/.test(u)) return true;
+    return /[?&]next=0(&|$)/.test(u) || /[?&]pn=1(&|$)/.test(u);
+  }
 
   /* ============ 界面 ============ */
 
@@ -289,7 +387,10 @@
     TIERS.forEach(function (t) {
       var o = el('div', 'o' + (config.tier === t.id ? ' on' : ''), t.label);
       o.dataset.v = t.id;
-      o.onclick = function () { config.tier = t.id; save(); pick(tg, t.id); };
+      o.onclick = function () {
+        config.tier = t.id; save(); pick(tg, t.id);
+        resetCount(); drawBanner();     /* 旧数字属于旧规则，清掉 */
+      };
       tg.appendChild(o);
     });
     panel.appendChild(tg);
@@ -299,7 +400,10 @@
     SUBS.forEach(function (t) {
       var o = el('div', 'o' + (config.sub === t.id ? ' on' : ''), t.label);
       o.dataset.v = t.id;
-      o.onclick = function () { config.sub = t.id; save(); pick(sg, t.id); };
+      o.onclick = function () {
+        config.sub = t.id; save(); pick(sg, t.id);
+        resetCount(); drawBanner();
+      };
       sg.appendChild(o);
     });
     panel.appendChild(sg);
@@ -368,7 +472,8 @@
 
     if (bHost && bHost.isConnected) {
       if (bText) {
-        bText.textContent = '已清 ' + removed + ' 条';
+        bText.textContent = '已清 ' + statTotal() + ' 条';
+        bText.title = '一级评论 ' + stat.r + ' 条 · 楼中楼 ' + stat.s + ' 条';
         bText.classList.toggle('dk', isDark());
       }
       return;
@@ -391,7 +496,8 @@
     }
 
     if (bText) {
-      bText.textContent = '已清 ' + removed + ' 条';
+      bText.textContent = '已清 ' + statTotal() + ' 条';
+      bText.title = '一级评论 ' + stat.r + ' 条 · 楼中楼 ' + stat.s + ' 条';
       bText.classList.toggle('dk', isDark());
     }
     if (m.before) m.parent.insertBefore(bHost, m.before);
@@ -446,9 +552,38 @@
     if (moShadow) { moShadow.disconnect(); moShadow = null; }
   }
 
-  function markDirty() { drawBanner(); }
-
   /* ============ 拦截 ============ */
+
+  /*
+   * 复刻一份响应。改过的数据要塞回给页面，但不复制真实 Response 会有麻烦：
+   *   - 有的埋点 / 日志会读 response.type、url
+   *   - 被 302 跟随过的响应，body 已消费，直接 clone 会抛
+   * 复制失败就原样放行（评论没删掉，但至少不炸页面），也不记数。
+   */
+  var RESP_KEYS = ['type', 'url', 'redirected'];
+
+  function cloneRes(res, text) {
+    var headers = new W.Headers(res.headers);
+    try { headers['delete']('content-length'); } catch (e) {}
+    try { headers['delete']('content-encoding'); } catch (e) {}
+    var opts = { status: res.status, statusText: res.statusText, headers: headers };
+    var init = { status: res.status, statusText: res.statusText, headers: headers };
+    for (var i = 0; i < RESP_KEYS.length; i++) {
+      try { if (res[RESP_KEYS[i]] !== undefined) init[RESP_KEYS[i]] = res[RESP_KEYS[i]]; } catch (e) {}
+    }
+    var out;
+    try { out = new W.Response(text, init); }
+    catch (e) { out = new W.Response(text, opts); }
+
+    for (var j = 0; j < RESP_KEYS.length; j++) {
+      (function (k) {
+        try {
+          Object.defineProperty(out, k, { configurable: true, get: function () { return res[k]; } });
+        } catch (e) {}
+      })(RESP_KEYS[j]);
+    }
+    return out;
+  }
 
   function hookFetch() {
     var raw = W.fetch;
@@ -460,23 +595,31 @@
       var promise = raw.apply(this, arguments);
       if (!kind) return promise;
 
+      var first = kind === 1 && isFirstPageReq(url);
+
       return promise.then(function (res) {
         if (!res || !res.ok) return res;
         return res.clone().text().then(function (txt) {
           var json;
           try { json = JSON.parse(txt); } catch (e) { return res; }
 
-          var n = 0;
-          try { n = processPayload(json, kind); } catch (e) { return res; }
-          if (!n) return res;
+          var r = null;
+          try { r = filterPayload(json, kind); } catch (e) { return res; }
 
-          var headers = new W.Headers(res.headers);
-          headers['delete']('content-length');
-          return new W.Response(JSON.stringify(json), {
-            status: res.status,
-            statusText: res.statusText,
-            headers: headers
-          });
+          /* 首屏：换成新的那个列表，数字重新算（请求失败就不动） */
+          if (first && r) onFirstPage();
+          if (!r || !r.items.length) {
+            if (first && r) drawBanner();
+            return res;
+          }
+
+          var out;
+          try { out = cloneRes(res, JSON.stringify(json)); }
+          catch (e) { return res; }
+
+          /* 真的交给页面了才记账 */
+          settle(r);
+          return out;
         })['catch'](function () { return res; });
       });
     };
@@ -485,51 +628,95 @@
     W.fetch = wrapped;
   }
 
+  /*
+   * XHR：responseText / response 都是只读原型属性，只能在实例上挂 getter 覆盖。
+   *
+   * 关键是「什么时候覆盖」。如果等 readystatechange 再挂，就依赖监听器的注册顺序——
+   * 页面只要比我们早注册（比如 open 之前就挂了 onloadend），它读到的就是原始数据：
+   * 评论没删掉，数字却涨了。这是最难复现的那类 bug。
+   *
+   * 所以改成「读的时候才变」：在 send() 里就挂上 getter，
+   * 不管页面从哪个回调、按什么顺序读，读到的都是过滤后的数据。
+   */
   function hookXHR() {
     var XHR = W.XMLHttpRequest;
     if (!XHR || XHR.__dfy) return;
 
-    var open = XHR.prototype.open;
-    XHR.prototype.open = function (m, url) {
-      this.__dfyUrl = url;
-      this.__dfyDone = 0;   /* 实例可能被复用，每次 open 都要重置 */
+    var proto = XHR.prototype;
+    var dText = null, dResp = null;
+    try {
+      dText = Object.getOwnPropertyDescriptor(proto, 'responseText');
+      dResp = Object.getOwnPropertyDescriptor(proto, 'response');
+    } catch (e) {}
+    if (!dText || !dText.get || !dResp || !dResp.get) return;
+
+    var getText = dText.get;
+    var getResp = dResp.get;
+
+    /* 一份响应只解析一次，两个属性共用结果 */
+    function once(xhr) {
+      if (xhr.__dfyDone) return xhr.__dfyCache;
+      if (xhr.readyState !== 4) return null;          /* 还在下载，先别缓存 */
+      if (!xhr.__dfyKind) return null;
+      if (xhr.status < 200 || xhr.status >= 300) { xhr.__dfyDone = 1; return (xhr.__dfyCache = null); }
+
+      xhr.__dfyDone = 1;
+      var r = null;
+      try {
+        var rt = xhr.responseType;
+        var isJson = rt === 'json';
+        if (!isJson && rt !== '' && rt !== 'text') { return (xhr.__dfyCache = null); }
+
+        var raw = isJson ? getResp.call(xhr) : getText.call(xhr);
+        if (!raw) return (xhr.__dfyCache = null);
+
+        var obj = isJson ? raw : JSON.parse(raw);
+        var f = filterPayload(obj, xhr.__dfyKind);
+        if (xhr.__dfyFirst && f) onFirstPage();      /* 首屏：换成新列表，重新算 */
+        if (!f || !f.items.length) {
+          if (xhr.__dfyFirst && f) drawBanner();
+          return (xhr.__dfyCache = null);
+        }
+        f.isJson = isJson;
+        f.obj = obj;
+        f.out = isJson ? obj : JSON.stringify(obj);
+        settle(f);          /* 改过之后才记账 */
+        r = f;
+      } catch (err) { r = null; }
+      return (xhr.__dfyCache = r);
+    }
+
+    var open = proto.open;
+    proto.open = function (m, url) {
+      this.__dfyKind = apiKind(url);
+      this.__dfyFirst = this.__dfyKind === 1 && isFirstPageReq(url);
+      this.__dfyDone = 0;        /* 实例会被连接池复用，每次 open 都要重置 */
+      this.__dfyCache = null;
       return open.apply(this, arguments);
     };
 
-    var send = XHR.prototype.send;
-    XHR.prototype.send = function () {
-      var url = this.__dfyUrl;
-      var kind = apiKind(url);
-      if (!kind) return send.apply(this, arguments);
-
+    var send = proto.send;
+    proto.send = function () {
       var xhr = this;
-      xhr.addEventListener('readystatechange', function () {
-        if (xhr.readyState !== 4 || xhr.__dfyDone) return;
-        xhr.__dfyDone = 1;
-        if (xhr.status < 200 || xhr.status >= 300) return;
-
+      if (xhr.__dfyKind) {
         try {
-          var isJson = xhr.responseType === 'json';
-          var raw = isJson ? xhr.response : xhr.responseText;
-          if (!raw) return;
-
-          var obj = isJson ? raw : JSON.parse(raw);
-          if (!processPayload(obj, kind)) return;
-
-          var out = JSON.stringify(obj);
-          var define = function (k, v) {
-            try { Object.defineProperty(xhr, k, { configurable: true, get: function () { return v; } }); }
-            catch (e) {}
-          };
-          if (isJson) {
-            define('response', obj);
-          } else {
-            define('responseText', out);
-            define('response', out);
-          }
+          Object.defineProperty(xhr, 'responseText', {
+            configurable: true,
+            get: function () {
+              if (xhr.responseType === 'json') return getText.call(xhr);  /* 原生就该抛 */
+              var r = once(xhr);
+              return (r && r.items.length) ? r.out : getText.call(xhr);
+            }
+          });
+          Object.defineProperty(xhr, 'response', {
+            configurable: true,
+            get: function () {
+              var r = once(xhr);
+              return (r && r.items.length) ? (r.isJson ? r.obj : r.out) : getResp.call(xhr);
+            }
+          });
         } catch (e) {}
-      });
-
+      }
       return send.apply(this, arguments);
     };
 
@@ -556,10 +743,12 @@
     boot();
   }
 
-  /* 唯一的入口：脚本管理器菜单 */
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') closePanel();
-  }, { passive: true });
+  /* Esc 关闭面板。事件要从页面的 window 上听 */
+  try {
+    (W.addEventListener ? W : document).addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' || e.keyCode === 27) closePanel();
+    }, true);
+  } catch (e) {}
 
   if (typeof GM_registerMenuCommand === 'function') {
     try {
