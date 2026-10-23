@@ -32,7 +32,10 @@
   var VALID_TIER = { cup: 1, standard: 1, kill: 1, atonly: 1 };
   var VALID_SUB  = { only: 1, whole: 1, none: 1 };
 
-  var config = { tier: 'standard', sub: 'only', showCount: true };
+  var MAX_WORDS = 100;   /* 自定义屏蔽词上限 */
+  var MAX_LEN   = 24;    /* 单条长度上限 */
+
+  var config = { tier: 'standard', sub: 'only', showCount: true, words: [] };
 
   (function load() {
     var raw = null;
@@ -45,15 +48,79 @@
       if (VALID_TIER[o.tier]) config.tier = o.tier;
       if (VALID_SUB[o.sub]) config.sub = o.sub;
       if (typeof o.showCount === 'boolean') config.showCount = o.showCount;
+      if (o.words && o.words.length) {
+        /* 去空、去重、截断，脏数据一律丢掉，不让它拖累每一条评论的判定 */
+        var ws = [], seen = Object.create(null), w, lw;
+        for (var i = 0; i < o.words.length && ws.length < MAX_WORDS; i++) {
+          w = o.words[i];
+          if (typeof w !== 'string') continue;
+          w = w.replace(/^\s+|\s+$/g, '').slice(0, MAX_LEN);
+          if (!w) continue;
+          lw = w.toLowerCase();
+          if (seen[lw]) continue;
+          seen[lw] = 1;
+          ws.push(w);
+        }
+        config.words = ws;
+      }
     } catch (e) {}
   })();
 
-  function save() {
+  /* 写盘，返回是否真的写成功 */
+  function writeOut() {
     var s = JSON.stringify(config);
     try {
       if (HAS_GM) GM_setValue(SKEY, s);
       else W.localStorage.setItem(SKEY, s);
-    } catch (e) {}
+    } catch (e) { return false; }
+    return true;
+  }
+
+  function readBack() {
+    try {
+      var raw = HAS_GM ? GM_getValue(SKEY, null) : W.localStorage.getItem(SKEY);
+      if (!raw) return null;
+      return typeof raw === 'string' ? JSON.parse(raw) : raw;
+    } catch (e) { return null; }
+  }
+
+  /*
+   * 保存 = 写盘 + 回读校验。
+   * 用户点「保存」时其实早就生效了（改一下就落盘），这个按钮的意义是
+   * 「确认刚刚那些改动真的存住了」，所以这里真的再读一遍比对，
+   * 对不上就报失败，不能给一个假的「保存成功」。
+   */
+  function save() {
+    var want = JSON.stringify(config);
+    if (!writeOut()) return { ok: false, msg: '保存失败，浏览器拒绝了写入' };
+
+    var back = readBack();
+    if (!back || typeof back !== 'object') return { ok: false, msg: '保存失败，没有读回来' };
+
+    /* 最硬的一条：读回来的整串必须和我们写进去的一致 */
+    if (JSON.stringify(back) !== want) return { ok: false, msg: '保存失败，读回来的内容不对' };
+
+    /* 比对真正决定行为的那几项 */
+    if (back.tier !== config.tier) return { ok: false, msg: '保存失败，档位没有存住' };
+    if (back.sub !== config.sub) return { ok: false, msg: '保存失败，楼中楼设置没有存住' };
+    if ((back.showCount ? 1 : 0) !== (config.showCount ? 1 : 0)) return { ok: false, msg: '保存失败，开关没有存住' };
+
+    var bw = back.words;
+    if (!bw || bw.length !== config.words.length) return { ok: false, msg: '保存失败，屏蔽词数量对不上' };
+    for (var i = 0; i < config.words.length; i++) {
+      if (bw[i] !== config.words[i]) return { ok: false, msg: '保存失败，屏蔽词没存全' };
+    }
+    return { ok: true };
+  }
+
+  /* 保存并提示：成功才说成功 */
+  function saveAndToast(alsoClose) {
+    var r = save();
+    /* 提示条贴着「用户正在看的那个面板」出现，所以要在关面板之前量 */
+    var anchor = (subHost && subHost.style.display !== 'none') ? subPanel : panel;
+    toast(r.ok ? '保存成功' : r.msg, anchor);
+    /* 存住了才收界面；失败就把界面留在原地，让人看得到原因 */
+    if (r.ok && alsoClose) { closeSub(false); closePanel(); }
   }
 
   /* ============ 判定 ============ */
@@ -65,6 +132,49 @@
   var RE_CHAR  = /[鱼鲸]/;
   var RE_PUNCT = /[：；]/;
   var RE_CORNER = /[「」]/;
+
+  /*
+   * 自定义屏蔽词。
+   *
+   * 旧写法是「每条评论 toLowerCase + 逐个 indexOf」，100 个词 × 几千条评论
+   * 就是几十万次字符串扫描。改成合成一个正则：V8 的匹配器比 JS 循环快得多，
+   * 而且只扫一遍，词越多越划算。
+   *
+   * wordsRe 三态：undefined = 还没构建，null = 没有词或构建失败。
+   */
+  var wordsRe;
+
+  function escapeRe(s) {
+    /* 把正则元字符全部转义：含 | 和 -，否则词里带竖线会破坏整个交替结构 */
+    return s.replace(/[.*+?^${}()|[\]\\/|-]/g, '\\$&');
+  }
+
+  function customRe() {
+    if (wordsRe !== undefined) return wordsRe;
+    var ws = config.words, parts = [], i;
+    for (i = 0; i < ws.length; i++) {
+      if (ws[i]) parts.push(escapeRe(ws[i]));
+    }
+    if (!parts.length) { wordsRe = null; return null; }
+    try { wordsRe = new RegExp(parts.join('|'), 'i'); }
+    catch (e) { wordsRe = null; }
+    return wordsRe;
+  }
+
+  /* 命中任意一个自定义词就屏蔽。不区分大小写，包含即命中 */
+  function hitCustomWord(text) {
+    if (!config.words.length) return false;
+    var re = customRe();
+    if (!re) {
+      /* 极端情况（正则构造失败）退回逐词比对，保证功能不丢 */
+      var s = text.toLowerCase();
+      for (var i = 0; i < config.words.length; i++) {
+        if (s.indexOf(config.words[i].toLowerCase()) !== -1) return true;
+      }
+      return false;
+    }
+    return re.test(text);
+  }
 
   function textOf(r) {
     var c = r && r.content;
@@ -84,6 +194,9 @@
     /* 账号名含鱼/鲸：所有档位一律屏蔽（这条精度 100%，不参与档位取舍） */
     var m = r && r.member;
     if (m && RE_NAME.test(m.uname || m.name || '')) return true;
+
+    /* 自定义屏蔽词：所有档位都生效，不受档位取舍影响 */
+    if (hitCustomWord(full)) return true;
 
     if (tier === 'atonly') return body.indexOf('@') !== -1;
 
@@ -111,7 +224,9 @@
    * 所以楼中楼按 rcount（真实条数）记，不会少算。
    */
   var stat = { r: 0, s: 0 };     /* 一级评论 / 楼中楼 */
-  var counted = {};              /* 本轮已计过数的 rpid */
+  var bannerCache = '';          /* 上次写进 DOM 的数字，用来跳过无变化的刷新 */
+  var counted = Object.create(null);   /* 本轮已计过数的 rpid */
+
   var countedN = 0;
   var COUNT_CAP = 50000;
 
@@ -120,26 +235,42 @@
   function resetCount() {
     stat.r = 0;
     stat.s = 0;
-    counted = {};
+    counted = Object.create(null);
     countedN = 0;
+    bannerCache = '';   /* 让文案缓存失效，清零后能真的刷出来 */
+  }
+
+  /* 同一轮里可能连着调好几次 drawBanner，合到一帧里只刷一次 */
+  var bannerQ = 0;
+
+  function queueBanner() {
+    if (bannerQ) return;
+    bannerQ = 1;
+    (typeof Promise !== 'undefined' ? Promise.resolve() : { then: function (f) { setTimeout(f, 0); } })
+      .then(function () {
+        bannerQ = 0;
+        drawBanner();
+      });
   }
 
   /* items: [{ id, r, s }]，id 为 null 时不去重 */
   function commitCount(items) {
-    var k, it, key;
+    var k, it, key, changed = false;
     for (k = 0; k < items.length; k++) {
       it = items[k];
       if (it.id != null) {
         key = '' + it.id;
         if (counted[key]) continue;
-        if (countedN >= COUNT_CAP) continue;
+        if (countedN >= COUNT_CAP) break;   /* 封顶了就别再白跑后面的条目 */
         counted[key] = 1;
         countedN++;
       }
-      stat.r += it.r || 0;
-      stat.s += it.s || 0;
+      if (it.r) { stat.r += it.r; changed = true; }
+      if (it.s) { stat.s += it.s; changed = true; }
     }
-    drawBanner();
+    /* 全是重复条目时数字没变，就别白刷一次 DOM */
+    if (!changed) return;
+    queueBanner();
     /* 单页路由切换后评论区整块重建，banner 会被一起摘掉，这里补插回去 */
     if (config.showCount && (!bHost || !bHost.isConnected)) watchMount();
   }
@@ -215,13 +346,13 @@
     var pinned = null;
     var tops = data.top_replies;
     if (tops && tops.length) {
-      pinned = {};
+      pinned = Object.create(null);
       for (i = 0; i < tops.length; i++) {
         if (tops[i] && tops[i].rpid != null) pinned[tops[i].rpid] = 1;
       }
     }
     if (data.top && data.top.upper && data.top.upper.rpid != null) {
-      pinned = pinned || {};
+      pinned = pinned || Object.create(null);
       pinned[data.top.upper.rpid] = 1;
     }
 
@@ -265,7 +396,7 @@
       }
 
       /* only：只删命中的楼中楼，主楼保留 */
-      var rest = [], drop = {};
+      var rest = [], drop = Object.create(null);
       for (k = 0; k < hitKids.length; k++) {
         j = hitKids[k];
         drop[j] = 1;
@@ -300,7 +431,7 @@
 
   /* ============ 界面 ============ */
 
-  var CSS = ":host{all:initial}\n*{box-sizing:border-box;margin:0;padding:0}\n\n/* 主题变量 */\n.t{\n  --bg:rgba(252,251,249,.94);--bd:rgba(0,0,0,.07);--tx:#1f1f23;--dim:#8b8b94;\n  --sh:0 20px 48px -18px rgba(0,0,0,.34),0 2px 6px -2px rgba(0,0,0,.06),inset 0 1px 0 rgba(255,255,255,.9);\n  --hv:rgba(0,0,0,.05);--tg:rgba(0,0,0,.1);--line:rgba(0,0,0,.07)\n}\n.t.dk{\n  --bg:rgba(38,38,44,.94);--bd:rgba(255,255,255,.1);--tx:#f0f0f4;--dim:#9a9aa6;\n  --sh:0 20px 48px -18px rgba(0,0,0,.8),0 2px 6px -2px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.07);\n  --hv:rgba(255,255,255,.09);--tg:rgba(255,255,255,.16);--line:rgba(255,255,255,.09)\n}\n\n/* 面板 */\n.p{position:fixed;top:78px;right:18px;z-index:2147483600;width:300px;\npadding:20px 20px 14px;border-radius:20px;\nbackground:var(--bg);\nbackdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);\nborder:1px solid var(--bd);box-shadow:var(--sh);\nfont-family:-apple-system,BlinkMacSystemFont,\"PingFang SC\",\"HarmonyOS Sans SC\",\"Microsoft YaHei\",sans-serif;\n-webkit-font-smoothing:antialiased;\ntransform-origin:top right;animation:pop .18s cubic-bezier(.2,.9,.3,1)}\n@keyframes pop{from{opacity:0;transform:scale(.93) translateY(-6px)}to{opacity:1;transform:none}}\n\n/* 关闭 */\n.x{position:absolute;top:13px;right:14px;width:26px;height:26px;\ndisplay:flex;align-items:center;justify-content:center;\nfont-size:19px;line-height:1;color:var(--dim);cursor:pointer;border-radius:8px;\ntransition:background .14s,color .14s;user-select:none}\n.x:hover{background:var(--hv);color:var(--tx)}\n\n/* 分组标题 */\n.g{font-size:11.5px;font-weight:600;color:var(--dim);letter-spacing:.1em;\npadding:16px 8px 7px}\n.g:first-of-type{padding-top:2px}\n\n/* 选项 */\n.o{font-size:16px;line-height:1.2;color:var(--tx);padding:12px 14px;border-radius:11px;cursor:pointer;\ntransition:background .14s,color .14s,transform .1s}\n.o:hover{background:var(--hv)}\n.o:active{transform:scale(.985)}\n.o.on{background:#fb7299;color:#fff;font-weight:600;\nbox-shadow:0 4px 14px -4px rgba(251,114,153,.7)}\n\n/* 开关行 */\n.s{display:flex;align-items:center;justify-content:space-between;\nfont-size:15px;color:var(--tx);\npadding:16px 8px 8px;margin-top:10px;border-top:1px solid var(--line)}\n.sw{width:42px;height:24px;border-radius:12px;background:var(--tg);position:relative;cursor:pointer;\ntransition:background .2s;flex:none}\n.sw.on{background:#fb7299}\n.sw:after{content:\"\";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;\nbackground:#fff;box-shadow:0 1px 4px rgba(0,0,0,.25);transition:left .2s cubic-bezier(.3,1.2,.5,1)}\n.sw.on:after{left:21px}\n\n/* 评论区那行字 */\n.b{display:inline-block;padding:12px 22px;margin:6px 0 20px;border-radius:12px;\nfont-size:16px;line-height:1.4;letter-spacing:.01em;user-select:none;font-weight:600;\nfont-family:-apple-system,BlinkMacSystemFont,\"PingFang SC\",\"HarmonyOS Sans SC\",\"Microsoft YaHei\",sans-serif;\n-webkit-font-smoothing:antialiased;\ncolor:#59616d;background:rgba(0,0,0,.055);\nborder:1px solid rgba(0,0,0,.055)}\n.b.dk{color:#c5cbd5;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.13)}";
+  var CSS = ":host{all:initial}\n*{box-sizing:border-box;margin:0;padding:0}\n\n/* 主题变量 */\n.t{\n  --bg:rgba(252,251,249,.94);--bd:rgba(0,0,0,.07);--tx:#1f1f23;--dim:#8b8b94;\n  --sh:0 20px 48px -18px rgba(0,0,0,.34),0 2px 6px -2px rgba(0,0,0,.06),inset 0 1px 0 rgba(255,255,255,.9);\n  --hv:rgba(0,0,0,.05);--tg:rgba(0,0,0,.1);--line:rgba(0,0,0,.07)\n}\n.t.dk{\n  --bg:rgba(38,38,44,.94);--bd:rgba(255,255,255,.1);--tx:#f0f0f4;--dim:#9a9aa6;\n  --sh:0 20px 48px -18px rgba(0,0,0,.8),0 2px 6px -2px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.07);\n  --hv:rgba(255,255,255,.09);--tg:rgba(255,255,255,.16);--line:rgba(255,255,255,.09)\n}\n\n/* 面板 */\n.p{position:fixed;top:78px;right:18px;z-index:2147483600;width:300px;\npadding:20px 20px 14px;border-radius:20px;\nbackground:var(--bg);\nbackdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);\nborder:1px solid var(--bd);box-shadow:var(--sh);\nfont-family:-apple-system,BlinkMacSystemFont,\"PingFang SC\",\"HarmonyOS Sans SC\",\"Microsoft YaHei\",sans-serif;\n-webkit-font-smoothing:antialiased;\ntransform-origin:top right;animation:pop .18s cubic-bezier(.2,.9,.3,1)}\n@keyframes pop{from{opacity:0;transform:scale(.93) translateY(-6px)}to{opacity:1;transform:none}}\n\n/* 关闭 */\n.x{position:absolute;top:13px;right:14px;width:26px;height:26px;\ndisplay:flex;align-items:center;justify-content:center;\nfont-size:19px;line-height:1;color:var(--dim);cursor:pointer;border-radius:8px;\ntransition:background .14s,color .14s;user-select:none}\n.x:hover{background:var(--hv);color:var(--tx)}\n\n/* 分组标题 */\n.g{font-size:11.5px;font-weight:600;color:var(--dim);letter-spacing:.1em;\npadding:16px 8px 7px}\n.g:first-of-type{padding-top:2px}\n\n/* 选项 */\n.o{font-size:16px;line-height:1.2;color:var(--tx);padding:12px 14px;border-radius:11px;cursor:pointer;\ntransition:background .14s,color .14s,transform .1s}\n.o:hover{background:var(--hv)}\n.o:active{transform:scale(.985)}\n.o.on{background:#fb7299;color:#fff;font-weight:600;\nbox-shadow:0 4px 14px -4px rgba(251,114,153,.7)}\n\n/* 开关行 */\n.s{display:flex;align-items:center;justify-content:space-between;\nfont-size:15px;color:var(--tx);\npadding:16px 8px 8px;margin-top:10px;border-top:1px solid var(--line)}\n.sw{width:42px;height:24px;border-radius:12px;background:var(--tg);position:relative;cursor:pointer;\ntransition:background .2s;flex:none}\n.sw.on{background:#fb7299}\n.sw:after{content:\"\";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;\nbackground:#fff;box-shadow:0 1px 4px rgba(0,0,0,.25);transition:left .2s cubic-bezier(.3,1.2,.5,1)}\n.sw.on:after{left:21px}\n\n/* 评论区那行字 */\n.b{display:inline-block;padding:12px 22px;margin:6px 0 20px;border-radius:12px;\nfont-size:16px;line-height:1.4;letter-spacing:.01em;user-select:none;font-weight:600;\nfont-family:-apple-system,BlinkMacSystemFont,\"PingFang SC\",\"HarmonyOS Sans SC\",\"Microsoft YaHei\",sans-serif;\n-webkit-font-smoothing:antialiased;\ncolor:#59616d;background:rgba(0,0,0,.055);\nborder:1px solid rgba(0,0,0,.055)}\n\n/* 气泡：已加的屏蔽词 */\n/* 词多了要能滚，否则面板会顶穿屏幕、保存按钮点不到。\n   只有真的溢出时才加 .more 显示底部渐隐，短列表不加，免得把内容淡掉 */\n.ws{display:flex;flex-wrap:wrap;gap:7px;padding:2px 6px 10px;min-height:8px;\nmax-height:min(46vh,340px);overflow-y:auto;overscroll-behavior:contain}\n.ws:empty{display:none}\n.ws.more{-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 18px),transparent 100%);\nmask-image:linear-gradient(to bottom,#000 calc(100% - 18px),transparent 100%)}\n/* 滚动条做得轻一点，别抢视觉 */\n.ws::-webkit-scrollbar{width:6px}\n.ws::-webkit-scrollbar-thumb{background:rgba(0,0,0,.16);border-radius:3px}\n.ws::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.28)}\n.ws::-webkit-scrollbar-track{background:transparent}\n.dk .ws::-webkit-scrollbar-thumb{background:rgba(255,255,255,.2)}\n.dk .ws::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.34)}\n.w{display:inline-flex;align-items:center;gap:5px;\nmax-width:100%;padding:6px 6px 6px 11px;border-radius:9px;\nfont-size:13.5px;line-height:1.25;color:var(--tx);\nbackground:rgba(251,114,153,.12);\nborder:1px solid rgba(251,114,153,.3);\nword-break:break-all;animation:tin .16s cubic-bezier(.2,.9,.3,1)}\n@keyframes tin{from{opacity:0;transform:scale(.88)}to{opacity:1;transform:none}}\n.w span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.w i{flex:none;width:17px;height:17px;display:flex;align-items:center;justify-content:center;\nfont-style:normal;font-size:13px;line-height:1;border-radius:5px;cursor:pointer;\ncolor:#fb7299;opacity:.75;transition:background .14s,opacity .14s}\n.w i:hover{background:rgba(251,114,153,.2);opacity:1}\n.w.dk{background:rgba(251,114,153,.16);border-color:rgba(251,114,153,.34)}\n\n/* 输入行：输入框 + 确定 */\n.r{display:flex;gap:8px;padding:2px 6px 4px}\n.in{flex:1;min-width:0;height:38px;padding:0 12px;border-radius:10px;\nfont-size:14.5px;font-family:inherit;color:var(--tx);\nbackground:var(--hv);border:1px solid var(--bd);outline:none;\ntransition:border-color .14s,background .14s}\n.in::placeholder{color:var(--dim)}\n.in:focus{border-color:rgba(251,114,153,.55);background:var(--tg)}\n.btn{flex:none;height:38px;padding:0 15px;border-radius:10px;\nfont-size:14.5px;font-weight:600;line-height:38px;cursor:pointer;\ncolor:var(--tx);background:var(--hv);border:1px solid var(--bd);\ntransition:background .14s,opacity .14s,transform .1s}\n.btn:hover{background:var(--tg)}\n.btn:active{transform:scale(.97)}\n.btn.pri{color:#fff;background:#fb7299;border-color:#fb7299;\nbox-shadow:0 4px 14px -6px rgba(251,114,153,.8)}\n.btn.pri:hover{background:#fa5c8b}\n\n\n/* 底部操作区 */\n.f{display:flex;justify-content:flex-end;gap:8px;\npadding:14px 6px 2px;margin-top:8px;border-top:1px solid var(--line)}\n\n/* 二级页 */\n.p2{position:fixed;top:78px;right:18px;z-index:2147483601;width:330px;\nmax-height:calc(100vh - 96px);display:flex;flex-direction:column;\npadding:20px 20px 14px;border-radius:20px;\nbackground:var(--bg);\nbackdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);\nborder:1px solid var(--bd);box-shadow:var(--sh);\nfont-family:-apple-system,BlinkMacSystemFont,\"PingFang SC\",\"HarmonyOS Sans SC\",\"Microsoft YaHei\",sans-serif;\n-webkit-font-smoothing:antialiased;\ntransform-origin:top right;animation:pop .18s cubic-bezier(.2,.9,.3,1)}\n.tip{font-size:12px;line-height:1.5;color:var(--dim);padding:8px 6px 0}\n\n/* 保存成功提示：贴在面板上方出现，位置由 JS 算 */\n.toast{position:fixed;z-index:2147483647;padding:11px 22px;border-radius:12px;\nmax-width:min(360px,80vw);\nfont-size:14.5px;font-weight:600;line-height:1.35;\nbackground:rgba(38,38,44,.94);color:#fff;\nborder:1px solid rgba(255,255,255,.14);\nbox-shadow:0 16px 40px -14px rgba(0,0,0,.6);\nopacity:0;pointer-events:none;\ntransform:translateY(6px);\ntransition:opacity .2s ease,transform .2s cubic-bezier(.2,.9,.3,1)}\n.toast.on{opacity:1;transform:translateY(0)}\n.toast.dk{background:rgba(252,251,249,.96);color:#1f1f23;\nborder:1px solid rgba(0,0,0,.08)}";
  var TIERS = [
     { id: 'cup',      label: '小杯' },
     { id: 'standard', label: '标准' },
@@ -316,6 +447,9 @@
 
   var host = null, panel = null, swEl = null;
   var bHost = null, bText = null;
+  var subHost = null, subPanel = null;   /* 自定义屏蔽词那个二级界面 */
+  var listEl = null, inputEl = null;      /* 气泡区 / 输入框 */
+  var toastHost = null, toastEl = null, toastTimer = 0;
 
   function el(tag, cls, txt) {
     var e = document.createElement(tag);
@@ -338,8 +472,16 @@
   }
 
   function syncTheme() {
+    var dk = isDark();
     if (panel) applyTheme(panel);
-    if (bText) bText.classList.toggle('dk', isDark());
+    if (subPanel) applyTheme(subPanel);
+    if (bText) bText.classList.toggle('dk', dk);
+    if (toastEl) toastEl.classList.toggle('dk', dk);
+    if (listEl && listEl.children) {
+      for (var i = 0; i < listEl.children.length; i++) {
+        listEl.children[i].classList.toggle('dk', dk);
+      }
+    }
   }
 
   /* html.dark 变的时候跟着变 */
@@ -356,6 +498,234 @@
       attributes: true,
       attributeFilter: ['class', 'data-theme']
     });
+  }
+
+  /* ============ 自定义屏蔽词 ============ */
+
+  /* 词表变了：清正则缓存 + 旧计数作废 + 立刻落盘（点叉即生效，不等保存） */
+  function wordsChanged() {
+    wordsRe = undefined;
+    resetCount();
+    drawBanner();
+    writeOut();
+  }
+
+  function addWord(raw) {
+    var w = (raw == null ? '' : String(raw)).replace(/^\s+|\s+$/g, '').replace(/\s+/g, ' ');
+    if (!w) return { ok: false, msg: '词不能为空' };
+    if (w.length > MAX_LEN) return { ok: false, msg: '最多 ' + MAX_LEN + ' 个字' };
+    if (config.words.length >= MAX_WORDS) return { ok: false, msg: '最多 ' + MAX_WORDS + ' 个词' };
+    for (var i = 0; i < config.words.length; i++) {
+      if (config.words[i].toLowerCase() === w.toLowerCase()) return { ok: false, msg: '这个已经有了' };
+    }
+    config.words.push(w);
+    return { ok: true, word: w };
+  }
+
+  function removeWord(w) {
+    for (var i = 0; i < config.words.length; i++) {
+      if (config.words[i] === w) { config.words.splice(i, 1); return true; }
+    }
+    return false;
+  }
+
+  function drawWords() {
+    if (!listEl) return;
+    while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+    var dk = isDark();
+    for (var i = 0; i < config.words.length; i++) {
+      listEl.appendChild(makeBubble(config.words[i], dk));
+    }
+    syncFade();
+  }
+
+  /* 内容溢出了才加底部渐隐，暗示还能往下滚 */
+  function syncFade() {
+    if (!listEl) return;
+    try {
+      listEl.classList.toggle('more', listEl.scrollHeight > listEl.clientHeight + 1);
+    } catch (e) {}
+  }
+
+  function makeBubble(w, dk) {
+    var b = el('div', 'w' + (dk ? ' dk' : ''));
+    b.appendChild(el('span', null, w));
+    var x = el('i', null, '×');
+    x.title = '删除';
+    x.onclick = function () {
+      removeWord(w);
+      drawWords();
+      wordsChanged();
+    };
+    b.appendChild(x);
+    return b;
+  }
+
+  /* 每个 shadow root 都要自己的一份样式 */
+  function ensureStyleIn(root) {
+    var st = el('style');
+    st.textContent = CSS;
+    root.appendChild(st);
+  }
+
+  /*
+   * 提示条固定摆在「用户正在看的那个面板」上方：
+   * 水平方向对齐面板中线，垂直方向贴面板顶边往上 12px。
+   * 面板是 fixed + top:78px/right:18px，尺寸随内容变，所以每次量了再算。
+   * 上面放不下（面板很高 / 窗口很矮）就翻到面板下方，最后夹回视口。
+   */
+  function placeToast(anchor) {
+    if (!toastEl) return;
+
+    var de = document.documentElement;
+    var vw = W.innerWidth || (de && de.clientWidth) || 0;
+    var vh = W.innerHeight || (de && de.clientHeight) || 0;
+    if (!vw || !vh) return;
+
+    var tw = toastEl.offsetWidth || 0;
+    var th = toastEl.offsetHeight || 0;
+    var GAP = 12;      /* 和面板边缘的距离 */
+    var EDGE = 12;     /* 离视口边缘至少留这么多 */
+
+    var rect = null;
+    try {
+      if (anchor && anchor.getBoundingClientRect) {
+        var b = anchor.getBoundingClientRect();
+        if (b && b.width) rect = b;     /* 面板不可见时量到 0，就当没有锚点 */
+      }
+    } catch (e) { rect = null; }
+
+    var left, top;
+    if (rect) {
+      left = Math.round(rect.left + (rect.width - tw) / 2);
+      top = Math.round(rect.top - GAP - th);          /* 面板上方 */
+      if (top < EDGE) top = Math.round(rect.bottom + GAP);   /* 上面放不下就翻到下面 */
+    } else {
+      /* 没有锚点：落在面板原本待的那块区域（右侧 18px、宽 300px）上方 */
+      left = Math.round(vw - 18 - 300 + (300 - tw) / 2);
+      top = 78 - GAP - th;
+      if (top < EDGE) top = 78 + GAP;   /* 太高了放不下就落到面板位置下面一点 */
+    }
+
+    if (left < EDGE) left = EDGE;
+    if (left + tw > vw - EDGE) left = vw - EDGE - tw;
+    if (top < EDGE) top = EDGE;
+    if (top + th > vh - EDGE) top = vh - EDGE - th;
+
+    toastEl.style.left = left + 'px';
+    toastEl.style.top = top + 'px';
+    toastEl.style.right = 'auto';
+    toastEl.style.bottom = 'auto';
+  }
+
+  function toast(msg, anchor) {
+    if (!toastHost) {
+      toastHost = el('div');
+      toastHost.style.cssText = 'all:initial';
+      var sh = toastHost.attachShadow({ mode: 'open' });
+      ensureStyleIn(sh);
+      toastEl = el('div', 'toast');
+      sh.appendChild(toastEl);
+      (document.body || document.documentElement).appendChild(toastHost);
+    }
+    if (!toastHost.isConnected) (document.body || document.documentElement).appendChild(toastHost);
+
+    toastEl.textContent = msg;
+    toastEl.classList.toggle('dk', isDark());
+
+    /* 先摆好位再显示，免得先闪一下再跳过去 */
+    placeToast(anchor);
+    toastEl.classList.remove('on');
+    void toastEl.offsetWidth;
+    toastEl.classList.add('on');
+
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      toastTimer = 0;
+      if (toastEl) toastEl.classList.remove('on');
+    }, 1800);
+  }
+
+  function header(onClose) {
+    var h = el('div', 'x', '×');
+    h.title = '关闭';
+    h.onclick = onClose;
+    return h;
+  }
+
+  /* ---------- 二级界面：自定义屏蔽词 ---------- */
+  function buildSub() {
+    if (subHost) return;
+
+    subHost = el('div');
+    subHost.style.cssText = 'all:initial;display:none';
+    var sh = subHost.attachShadow({ mode: 'open' });
+    ensureStyleIn(sh);
+
+    subPanel = el('div', 'p2 t');
+    applyTheme(subPanel);
+
+    subPanel.appendChild(header(function () { closeSub(true); }));
+
+    subPanel.appendChild(el('div', 'g', '自定义屏蔽词'));
+
+    listEl = el('div', 'ws');
+    subPanel.appendChild(listEl);
+
+    var row = el('div', 'r');
+    inputEl = el('input', 'in');
+    inputEl.type = 'text';
+    inputEl.maxLength = MAX_LEN;
+    inputEl.placeholder = '输入一个词，回车添加';
+    inputEl.onkeydown = function (e) {
+      if (e.keyCode === 13 || e.key === 'Enter') { e.preventDefault(); commitInput(); }
+    };
+    row.appendChild(inputEl);
+
+    var add = el('div', 'btn', '确定');
+    add.onclick = commitInput;
+    row.appendChild(add);
+    subPanel.appendChild(row);
+
+    subPanel.appendChild(el('div', 'tip', '命中任意一个词就屏蔽（不分大小写，包含即命中）。' +
+      '所有档位都生效。' + MAX_WORDS + ' 个词以内。'));
+
+    var foot = el('div', 'f');
+    var ok = el('div', 'btn pri', '保存');
+    ok.onclick = function () { saveAndToast(true); };   /* 等同于「保存 + 点叉」，全部退出 */
+    foot.appendChild(ok);
+    subPanel.appendChild(foot);
+
+    sh.appendChild(subPanel);
+    (document.body || document.documentElement).appendChild(subHost);
+  }
+
+  function commitInput() {
+    if (!inputEl) return;
+    var r = addWord(inputEl.value);
+    if (!r.ok) { toast(r.msg, subPanel); return; }
+    inputEl.value = '';
+    drawWords();
+    wordsChanged();
+    inputEl.focus();
+  }
+
+  function openSub() {
+    buildSub();
+    applyTheme(subPanel);
+    reattach(subHost);
+    drawWords();
+    /* 两个面板位置一样，编辑时把主面板收起来，免得叠在一起 */
+    if (host) host.style.display = 'none';
+    subHost.style.display = 'block';
+    syncFade();      /* 显示出来之后才量得到真实高度 */
+    if (inputEl) { try { inputEl.focus(); } catch (e) {} }
+  }
+
+  /* back=true：叉掉二级页回主面板；保存时传 false，所有界面一起退出 */
+  function closeSub(back) {
+    if (subHost) subHost.style.display = 'none';
+    if (back !== false) openPanel();
   }
 
   function pick(group, id) {
@@ -388,7 +758,7 @@
       var o = el('div', 'o' + (config.tier === t.id ? ' on' : ''), t.label);
       o.dataset.v = t.id;
       o.onclick = function () {
-        config.tier = t.id; save(); pick(tg, t.id);
+        config.tier = t.id; writeOut(); pick(tg, t.id);
         resetCount(); drawBanner();     /* 旧数字属于旧规则，清掉 */
       };
       tg.appendChild(o);
@@ -401,19 +771,25 @@
       var o = el('div', 'o' + (config.sub === t.id ? ' on' : ''), t.label);
       o.dataset.v = t.id;
       o.onclick = function () {
-        config.sub = t.id; save(); pick(sg, t.id);
+        config.sub = t.id; writeOut(); pick(sg, t.id);
         resetCount(); drawBanner();
       };
       sg.appendChild(o);
     });
     panel.appendChild(sg);
 
+    /* 自定义屏蔽词入口 */
+    panel.appendChild(el('div', 'g', '自定义屏蔽词'));
+    var wr = el('div', 'o', '编辑屏蔽词…');
+    wr.onclick = openSub;
+    panel.appendChild(wr);
+
     var sr = el('div', 's');
     sr.appendChild(el('span', null, '显示已清条数'));
     swEl = el('div', 'sw' + (config.showCount ? ' on' : ''));
     swEl.onclick = function () {
       config.showCount = !config.showCount;
-      save();
+      writeOut();
       swEl.classList.toggle('on', config.showCount);
       if (config.showCount) {
         drawBanner();
@@ -426,13 +802,27 @@
     sr.appendChild(swEl);
     panel.appendChild(sr);
 
+    /* 主面板的保存：勾选即存，这里再确认一次并给个反馈 */
+    var foot = el('div', 'f');
+    var ok = el('div', 'btn pri', '保存');
+    ok.onclick = function () { saveAndToast(true); };
+    foot.appendChild(ok);
+    panel.appendChild(foot);
+
     sh.appendChild(panel);
     (document.body || document.documentElement).appendChild(host);
+  }
+
+  /* 页面整块重建时 host 会被一起摘掉，用之前先确认还挂在文档上 */
+  function reattach(h) {
+    if (!h) return;
+    if (!h.isConnected) (document.body || document.documentElement).appendChild(h);
   }
 
   function openPanel() {
     buildPanel();
     applyTheme(panel);
+    reattach(host);
     host.style.display = 'block';
   }
 
@@ -464,6 +854,23 @@
     return null;
   }
 
+  /* 文案没变就不碰 DOM：B站评论区滚动时这里会被高频调用 */
+  function updateBannerText() {
+    if (!bText) return;
+    var sig = stat.r + '/' + stat.s;
+    if (sig === bannerCache) return;   /* 数字没变，DOM 一个字都不写 */
+
+    var txt = '已清 ' + statTotal() + ' 条';
+    var tip = '一级评论 ' + stat.r + ' 条 · 楼中楼 ' + stat.s + ' 条';
+    bannerCache = sig;
+
+    /* 再和 DOM 上的实际值比一次：清零 / 清缓存之后数字往往没变，
+       这时连赋值都不做，免得白白触发一次样式重算 */
+    if (bText.textContent !== txt) bText.textContent = txt;
+    if (bText.title !== tip) bText.title = tip;
+    bText.classList.toggle('dk', isDark());
+  }
+
   function drawBanner() {
     if (!config.showCount) {
       if (bHost) { bHost.remove(); bHost = null; bText = null; }
@@ -471,11 +878,7 @@
     }
 
     if (bHost && bHost.isConnected) {
-      if (bText) {
-        bText.textContent = '已清 ' + statTotal() + ' 条';
-        bText.title = '一级评论 ' + stat.r + ' 条 · 楼中楼 ' + stat.s + ' 条';
-        bText.classList.toggle('dk', isDark());
-      }
+      updateBannerText();
       return;
     }
 
@@ -495,61 +898,44 @@
       sh.appendChild(bText);
     }
 
-    if (bText) {
-      bText.textContent = '已清 ' + statTotal() + ' 条';
-      bText.title = '一级评论 ' + stat.r + ' 条 · 楼中楼 ' + stat.s + ' 条';
-      bText.classList.toggle('dk', isDark());
-    }
+    updateBannerText();
     if (m.before) m.parent.insertBefore(bHost, m.before);
     else m.parent.appendChild(bHost);
   }
 
   /*
    * bili-comments 是懒加载的：DOMContentLoaded 时 shadowRoot 可能还不存在。
-   * 只在还没插上时才监听，插上就断开，避免常驻开销。
+   *
+   * 早期版本用 document 级 MutationObserver（subtree:true）等它出现，
+   * 在 B 站这种每秒几十次 DOM 变动的页面上开销很大，而且拿不到 shadowRoot
+   * 内部的变化还要再挂一个。改成廉价轮询：300ms 查一次，插上就停，
+   * 15 秒还没等到也停，不留常驻开销。
    */
-  var mo = null, moTimer = 0, moShadow = null;
+  var mountTimer = 0, mountTries = 0;
+
+  var MOUNT_MS = 300;
+  var MOUNT_MAX = 50;      /* 50 × 300ms = 15 秒 */
 
   function watchMount() {
-    if (mo || !config.showCount || !W.MutationObserver) return;
-
-    var tries = 0;
-
-    function retry() {
-      if (!config.showCount) { stopWatch(); return; }
-      if (bHost && bHost.isConnected) { stopWatch(); return; }
-      if (++tries > 40) { stopWatch(); return; }
-      drawBanner();
-      if (bHost && bHost.isConnected) { stopWatch(); return; }
-      watchShadow();
-    }
-
-    mo = new W.MutationObserver(retry);
-    mo.observe(document.documentElement, { childList: true, subtree: true });
-
-    /* 15 秒还没等到就放弃，不留常驻监听 */
-    moTimer = setTimeout(stopWatch, 15000);
+    if (mountTimer || !config.showCount) return;
+    mountTries = 0;
+    mountTimer = setTimeout(tickMount, MOUNT_MS);
   }
 
-  /* bili-comments 的内容在 shadowRoot 里，document 级观察器看不到，
-   * 所以要单独观察它。 */
-  function watchShadow() {
-    if (moShadow || !config.showCount) return;
-    var bc = document.querySelector('#commentapp bili-comments') || document.querySelector('bili-comments');
-    if (!bc || !bc.shadowRoot) return;
+  function tickMount() {
+    mountTimer = 0;
+    if (!config.showCount) return;
+    if (bHost && bHost.isConnected) return;
+    if (++mountTries > MOUNT_MAX) return;
 
-    moShadow = new W.MutationObserver(function () {
-      if (bHost && bHost.isConnected) { stopWatch(); return; }
-      drawBanner();
-      if (bHost && bHost.isConnected) stopWatch();
-    });
-    moShadow.observe(bc.shadowRoot, { childList: true, subtree: true });
+    drawBanner();
+    if (bHost && bHost.isConnected) return;
+    mountTimer = setTimeout(tickMount, MOUNT_MS);
   }
 
   function stopWatch() {
-    if (moTimer) { clearTimeout(moTimer); moTimer = 0; }
-    if (mo) { mo.disconnect(); mo = null; }
-    if (moShadow) { moShadow.disconnect(); moShadow = null; }
+    if (mountTimer) { clearTimeout(mountTimer); mountTimer = 0; }
+    mountTries = 0;
   }
 
   /* ============ 拦截 ============ */
@@ -564,16 +950,14 @@
 
   function cloneRes(res, text) {
     var headers = new W.Headers(res.headers);
+    /* 长度和编码都变了，留着会让浏览器按旧值处理 */
     try { headers['delete']('content-length'); } catch (e) {}
     try { headers['delete']('content-encoding'); } catch (e) {}
-    var opts = { status: res.status, statusText: res.statusText, headers: headers };
+
+    /* ResponseInit 只认 status / statusText / headers，别的塞进去会被忽略，
+       所以 type / url / redirected 走下面的 defineProperty 补 */
     var init = { status: res.status, statusText: res.statusText, headers: headers };
-    for (var i = 0; i < RESP_KEYS.length; i++) {
-      try { if (res[RESP_KEYS[i]] !== undefined) init[RESP_KEYS[i]] = res[RESP_KEYS[i]]; } catch (e) {}
-    }
-    var out;
-    try { out = new W.Response(text, init); }
-    catch (e) { out = new W.Response(text, opts); }
+    var out = new W.Response(text, init);
 
     for (var j = 0; j < RESP_KEYS.length; j++) {
       (function (k) {
@@ -606,12 +990,11 @@
           var r = null;
           try { r = filterPayload(json, kind); } catch (e) { return res; }
 
-          /* 首屏：换成新的那个列表，数字重新算（请求失败就不动） */
-          if (first && r) onFirstPage();
-          if (!r || !r.items.length) {
-            if (first && r) drawBanner();
-            return res;
-          }
+          /* 首屏：换成新的那个列表，数字重新算。
+             注意是「请求成功了就清」，不是「有命中才清」——
+             否则切到一个零评论 / 零命中的视频时，上一个视频的数字会残留。 */
+          if (first) { onFirstPage(); queueBanner(); }
+          if (!r || !r.items.length) return res;
 
           var out;
           try { out = cloneRes(res, JSON.stringify(json)); }
@@ -672,11 +1055,8 @@
 
         var obj = isJson ? raw : JSON.parse(raw);
         var f = filterPayload(obj, xhr.__dfyKind);
-        if (xhr.__dfyFirst && f) onFirstPage();      /* 首屏：换成新列表，重新算 */
-        if (!f || !f.items.length) {
-          if (xhr.__dfyFirst && f) drawBanner();
-          return (xhr.__dfyCache = null);
-        }
+        if (xhr.__dfyFirst) { onFirstPage(); queueBanner(); }   /* 首屏：换成新列表，重新算 */
+        if (!f || !f.items.length) return (xhr.__dfyCache = null);
         f.isJson = isJson;
         f.obj = obj;
         f.out = isJson ? obj : JSON.stringify(obj);
@@ -746,7 +1126,10 @@
   /* Esc 关闭面板。事件要从页面的 window 上听 */
   try {
     (W.addEventListener ? W : document).addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' || e.keyCode === 27) closePanel();
+      if (e.key !== 'Escape' && e.keyCode !== 27) return;
+      /* 二级页开着先关二级页，再按一次才关主面板 */
+      if (subHost && subHost.style.display !== 'none') { closeSub(true); return; }
+      closePanel();
     }, true);
   } catch (e) {}
 
