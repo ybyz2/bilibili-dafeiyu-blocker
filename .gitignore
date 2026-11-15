@@ -5,6 +5,10 @@ Thumbs.db
 
 # 本地测试
 *.tmp
+tests/
+
+# 代码审查报告：本地留档，不进仓库
+CODE_REVIEW.md
 
 # 与脚本无关的文件
 *.jpg

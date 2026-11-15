@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         屏蔽大肥鱼
 // @namespace    dafeiyu
-// @version      1.4.3
+// @version      1.4.4
 // @description  屏蔽B站评论区里的大肥鱼（简繁通吃），并可批量删除 / 拉黑
 // @match        https://www.bilibili.com/*
 // @match        https://t.bilibili.com/*
@@ -55,7 +55,15 @@
   var BOOK_MID_CAP = 3000;    /* 拉黑表：3000 条 ≈ 140KB */
   var BOOK_DEL_CAP = 20000;   /* 删除表：2 万条 ≈ 605KB，和 POOL_CAP 对齐 */
 
-  var config = { tier: 'standard', sub: 'only', showCount: true, words: [] };
+  /*
+   * showActs：评论区顶上那条横幅，除了「已清 N 条」之外，右边那一串
+   * （误判提醒 + 删除 / 拉黑按钮）要不要一起露出来。
+   *
+   * 默认关。理由：这行字天天挂在评论区顶上，比弹窗还显眼，
+   * 而删评论 / 拉黑本来就是低频操作 —— 需要的时候从面板里进就行。
+   * 想要当年那条「一眼看到、一键开干」的横幅，在「删除 / 拉黑」页里打开。
+   */
+  var config = { tier: 'standard', sub: 'only', showCount: true, showActs: false, words: [] };
 
   /*
    * 写操作能碰到的评论，只来自「页面自己已经加载出来的那份数据」。
@@ -139,6 +147,7 @@
       if (typeof o.tier === 'string' && own(VALID_TIER, o.tier)) config.tier = o.tier;
       if (typeof o.sub === 'string' && own(VALID_SUB, o.sub)) config.sub = o.sub;
       if (typeof o.showCount === 'boolean') config.showCount = o.showCount;
+      if (typeof o.showActs === 'boolean') config.showActs = o.showActs;
       if (Array.isArray(o.words) && o.words.length) {
         /* 去空、去重、截断，脏数据一律丢掉，不让它拖累每一条评论的判定 */
         var ws = [], seen = Object.create(null), w, lw;
@@ -177,6 +186,7 @@
     if (back.tier !== config.tier) return { ok: false, msg: '保存失败，档位没有存住' };
     if (back.sub !== config.sub) return { ok: false, msg: '保存失败，楼中楼设置没有存住' };
     if ((back.showCount ? 1 : 0) !== (config.showCount ? 1 : 0)) return { ok: false, msg: '保存失败，开关没有存住' };
+    if ((back.showActs ? 1 : 0) !== (config.showActs ? 1 : 0)) return { ok: false, msg: '保存失败，按钮开关没有存住' };
 
     var bw = back.words || [];
     if (bw.length !== config.words.length) return { ok: false, msg: '保存失败，屏蔽词数量对不上' };
@@ -1772,6 +1782,39 @@
     return drawConfirm(box);
   }
 
+  /*
+   * 横幅右侧（误判提醒 + 删除 / 拉黑按钮）的显示开关。
+   * 放在「删除 / 拉黑」页而不是「屏蔽设置」页 —— 它管的是这一页的两个入口，
+   * 用户在这里找它最顺手。和「显示已清条数」共用同一套 .s / .sw 样式。
+   */
+  function bannerActsRow() {
+    var sr = el('div', 's');
+    sr.appendChild(el('span', null, '评论区显示删除 / 拉黑'));
+    var sw = el('div', 'sw' + (config.showActs ? ' on' : ''));
+    sw.onclick = function () {
+      config.showActs = !config.showActs;
+      writeOut();
+      sw.classList.toggle('on', config.showActs);
+      syncBannerActs();
+      /*
+       * 原来关着、现在要露出来：横幅可能压根没建（关掉「显示已清条数」且无命中时
+       * drawBanner 会提前 return），也有可能是 display:none 藏着的。
+       * drawBanner 两条路径都会处理，再补一次 watchMount 兜住「DOM 还没挂上」。
+       */
+      drawBanner();
+      if (config.showActs && !bannerShown()) watchMount();
+    };
+    sr.appendChild(sw);
+
+    /* tip 不能塞进 .s —— 那是个 flex 行，塞进去会跟开关并排。单独包一层 */
+    var wrap = el('div');
+    wrap.appendChild(sr);
+    wrap.appendChild(el('div', 'tip',
+      '打开后，评论区顶部「已清 N 条」右边会显示误判提醒和删除 / 拉黑两个按钮。' +
+      '关掉就只能从这个面板进来。'));
+    return wrap;
+  }
+
   function drawConfirm(box) {
     var bodyEl = box;
     var delN = buildCandidates().length;
@@ -1780,6 +1823,9 @@
 
     /* 先摆警告：这一页所有操作都不可逆，进来第一眼就该看到 */
     bodyEl.appendChild(el('div', 'warn', WARN_TEXT));
+
+    /* 入口开关跟在警告后面，不抢警告的位置 */
+    bodyEl.appendChild(bannerActsRow());
 
     /* --- 删除 --- */
     bodyEl.appendChild(el('div', 'g', '删除评论'));
@@ -2129,6 +2175,7 @@
   var WARN_TEXT = '本插件根据关键词屏蔽，会出现误判。谨慎使用！';
 
   var bDel = null, bBlk = null, bName = null;
+  var bWarn = null, bActs = null;   /* 横幅右侧那一串：误判提醒 + 按钮组，默认收起 */
   var bBar = null;   /* 横幅里那个 .dfy-b 元素（在 shadow 内部，主题类要加在它身上） */
 
   /* 插到有评论区的那个容器里，样式也得挂到同一个 root 上 */
@@ -2167,24 +2214,44 @@
     bName = el('span', 'dfy-n');
     bar.appendChild(bName);
 
-    /* 「已清 N 条」右边紧跟一句警告，宽度不够时自动换行到下一行 */
-    var warn = el('span', 'dfy-w', WARN_TEXT);
-    warn.title = WARN_TEXT;
-    bar.appendChild(warn);
+    /*
+     * 「已清 N 条」右边紧跟一句警告，宽度不够时自动换行到下一行。
+     * 警告和按钮组默认是收起的（config.showActs），露不露由 syncBannerActs
+     * 决定 —— 建的时候只保证节点齐备，别在这里写死可见性。
+     */
+    bWarn = el('span', 'dfy-w', WARN_TEXT);
+    bWarn.title = WARN_TEXT;
+    bar.appendChild(bWarn);
 
-    var acts = el('div', 'dfy-a');
+    bActs = el('div', 'dfy-a');
     bDel = el('span', 'dfy-btn dfy-dg', '删除');
     bDel.title = '把命中的评论真正删掉（只能删自己稿件下的）';
     bDel.onclick = function () { quickAct('del'); };
-    acts.appendChild(bDel);
+    bActs.appendChild(bDel);
 
     bBlk = el('span', 'dfy-btn', '拉黑');
     bBlk.title = '把发这些评论的人加进黑名单';
     bBlk.onclick = function () { quickAct('block'); };
-    acts.appendChild(bBlk);
+    bActs.appendChild(bBlk);
 
-    bar.appendChild(acts);
+    bar.appendChild(bActs);
     sh.appendChild(bar);
+    syncBannerActs();
+  }
+
+  /*
+   * 横幅右侧（误判提醒 + 删除 / 拉黑按钮）显不显示，只看 config.showActs 一个来源。
+   *
+   * 藏起来用 display:none 而不是摘节点，和 drawBanner 里「整条横幅该藏」是同一套做法：
+   * 摘掉再插回来要重新走一遍 Shadow DOM 里的布局，而且节点在 JS 里还有引用
+   * （bDel / bBlk 的置灰状态、updateBannerText 的签名守卫都依赖它们）。
+   * 这里只在状态真的变了才碰 style，避免每次 drawBanner 都写一次 DOM。
+   */
+  function syncBannerActs() {
+    /* 显示时不写死 flex，留给 CSS 里的 .dfy-a{display:flex} —— 一处定义，别两处维护 */
+    var v = config.showActs ? '' : 'none';
+    if (bWarn && bWarn.style.display !== v) bWarn.style.display = v;
+    if (bActs && bActs.style.display !== v) bActs.style.display = v;
   }
 
 
@@ -2227,9 +2294,13 @@
      * 每次 updateBannerText 都无条件重写（实测约 3.6us/次）。
      */
     var sig = stat.r + '/' + stat.s + '/' + c.d + '/' + c.b + '/' +
-              (config.showCount ? 1 : 0) + (canAct ? 1 : 0) + (dk ? 1 : 0);
+              (config.showCount ? 1 : 0) + (config.showActs ? 1 : 0) +
+              (canAct ? 1 : 0) + (dk ? 1 : 0);
     if (sig === bannerCache) return;
     bannerCache = sig;
+
+    /* 开关是签名的一部分，走到这里的路径里可能已经翻过面了，顺手对齐一次 */
+    syncBannerActs();
 
     var txt = config.showCount ? ('已清 ' + statTotal() + ' 条') : '大肥鱼工具';
     var tip = '一级评论 ' + stat.r + ' 条 · 楼中楼 ' + stat.s + ' 条';
@@ -2280,7 +2351,7 @@
        * 一旦置空，下次有命中就要重新 attachShadow 并重新解析整份样式
        * （实测一次 ≈114us，其中绝大部分是 CSS 解析）。
        */
-      if (bHost) { bHost.style.display = 'none'; bannerCache = ''; }
+      if (bHost) { syncBannerActs(); bHost.style.display = 'none'; bannerCache = ''; }
       return;
     }
     /*
