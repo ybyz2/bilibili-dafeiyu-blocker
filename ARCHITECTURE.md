@@ -1,230 +1,226 @@
-# 实现说明（v1.4.4 现状）
+# 实现说明（v1.5.0）
 
-> 面向改代码的人。用户向的安装 / 使用说明在 [README.md](README.md)。
->
-> 立项期的数据调研文档（关键词命中率、对照组误删率、`@` 在两级评论里的语义差异等）已随
-> 过期资料一起删除 —— 它们描述的是 1.0 那套「专名 + 自称 + 结构模式 + 弱词组合」的规则集，
-> 和现在的实现已经没有对应关系。本文只写**现在这份代码实际是怎么跑的**。
+面向改代码的人。用户向的安装 / 使用说明在 [README.md](README.md)。
 
 ## 一、文件
 
 | 文件 | 说明 |
 |---|---|
-| `dafeiyu.user.js` | 全部实现，单文件，零构建。改完直接覆盖就能测 |
+| `dafeiyu.user.js` | 全部实现。单文件、零构建、零依赖，改完直接覆盖就能测 |
 | `README.md` | 用户向文档 |
-| `tests/` | 回归用例，Node 自带的 `vm` 把脚本原样加载进假 DOM，**测的是线上真正跑的那份代码** |
+| `tests/` | 本地回归用例（不进仓库），用 Node 的 `vm` 把脚本原样加载进假 DOM，调的是线上真跑的那份代码 |
 
-脚本没有构建步骤，也没有依赖。`@version` 是唯一需要手动同步的地方（README 徽章读的是 release tag）。
+## 二、分层
 
-## 二、拦截层：评论为什么不会闪
-
-所有屏蔽都发生在**接口数据层**，不碰 DOM：
+单个 IIFE 内部按职责分 6 层，靠命名空间和分节注释体现，不是打包产物。
 
 ```
-fetch / XHR  ──►  clone 响应  ──►  JSON.parse  ──►  filterPayload()  ──►  改过的 JSON 塞回去
-                                                          │
-                                                  评论从未进入渲染队列
+L5 启动      把各层接起来：注入回调、装页面钩子、跑第一帧
+L4 界面      主面板 / 二级页 / 横幅 / toast，三块 Shadow DOM
+L3 副作用    网络（写接口）、执行器（任务）、拦截（fetch / XHR）
+L2 服务      判定 / 过滤 / 候选集 / 设置变更，只返回纯数据
+L1 状态      7 个对象持有全部可变状态
+L0 纯逻辑    纯函数与常量
 ```
 
-- `hookFetch()`：包 `W.fetch`。`res.clone()` 用 try 包住 —— body 已被消费（比如 302 跟随过）时
-  `clone()` 是**同步抛** TypeError，逃逸出去会让页面的 `fetch()` reject，也就是炸页面。
-- `hookXHR()`：不覆盖 `readystatechange`，而是**在 `send()` 里就挂 getter** 盖住
-  `responseText` / `response`。覆盖原型上的只读属性做不到，只能在实例上挂。
-  这样做的好处是不依赖监听器注册顺序 —— 页面哪怕比我们早注册 `onloadend`，读到的也是过滤后的数据。
-- `apiKind(url)` 认四种：`/x/v2/reply/main`、`/x/v2/reply?`、`/x/v2/reply/reply`、`wbi/main`。
-  `del` / `add` / `action` / `report` 一律返回 0 放行。
-- 脚本自己的写请求走 `rawFetch`（hook 之前存下的原始引用），否则会自己拦自己。
+**依赖单向：L5 → L4 → L3 → L2 → L1 → L0。** 下层不认识上层。唯一的反向通路是 L1 的变更回调
+（`Ledger.onChange` / `Settings.onChange` / `CounterSink.setHandlers` / `Job.bind`），
+由 L5 在启动时注入。所以状态层完全不知道 UI 的存在。
 
-`isFirstPageReq()` 判断「这份数据是不是第一页」，第一页才清池子：
-新版用 `pagination_str={"offset":""}`，旧版用 `next=0` / `pn=1`。
+边界是实测过的：L0–L3 区间只有一处 `document`，是 `Me` 读 cookie；没有一处引用 `UI` / `UIState`。
 
-## 三、判定：`isBlocked(reply, tier)`
+## 三、模块
 
-优先级从上到下，命中即返回：
+### L0 `Pure`
 
-| 顺序 | 规则 | 说明 |
+纯函数与常量，不碰 DOM / 网络 / storage / 全局状态。
+
+| 内容 | 说明 |
+|---|---|
+| `TIMING` `LIMITS` `DEFAULT_CONFIG` `BLOCK_BATCH` | 全部魔数 |
+| `S2T` / `expandWord` / `buildWordsRe` / `escapeRe` | 简繁展开与正则构建 |
+| `RE_NAME` `RE_BRAND` `RE_CHAR` `RE_QUOTE` `RE_KILLP` `RE_AT` | 判定正则 |
+| `isBlocked(reply, ctx)` | 判定内核 |
+| `apiKind` `isFirstPageReq` | URL 分类与首屏判定 |
+| `explain` `shouldRetry` `isFatal` | 错误码 |
+| `normalizeConfig` `cleanWords` `addWord` | 数据整形 |
+
+### L1 状态（7 个对象）
+
+字段只在各自方法里改，外部读走查询、写走 set / mark。
+
+| 模块 | 职责 | 主要 API |
 |---|---|---|
-| 1 | 账号名含「肥鱼」 | `RE_NAME`，所有档位生效。精度最高，不参与档位取舍 |
-| 2 | 自定义屏蔽词 | 所有档位生效，不分大小写，包含即命中 |
-| 3 | 「只屏蔽 @」档 | 到此为止，只看 `@` |
-| 4 | 品牌词 | `RE_BRAND`：大肥鱼 / 肥鱼 / 鲸鱼 / 大肥鲸 / 鲸鱼娘 / 本鲸 / 本鱼 / 本肥鱼 / 主人 |
-| 5 | 小杯档 | 到此为止 |
-| 6 | `@` | `hasAt()` |
-| 7 | 标准档 | 到此为止 |
-| 8 | 单字 `鱼` / `鲸` | `RE_CHAR` |
-| 9 | 全角标点 / 破折号 / 直角引号 | `RE_KILLP` |
+| `Store` | storage 读写，全脚本唯一一处 try/catch 包 storage | `readConf` `writeConf` `readBook` `writeBook` |
+| `Config` | tier / sub / showCount / showActs / words | `set` `save` `saveAndVerify` + 各字段查询 |
+| `Pool` | 评论池、环形游标、rpid 索引、失效版本号 | `add` `find` `reset` `bump` `markHit` `markPinned` `rejudge` `items` `length` `ver` |
+| `Page` | 稿件上下文：oid / 代数 gen / UP 主 / 置顶集合 | `setOid` `gen` `setUpper` `addPinned` `isPinned` `reset` |
+| `Ledger` | 账本（拉黑表 m / 删除表 r） | `addMids` `markDeleted` `flush` `prune` `list` `hasMid` `isDeleted` `clear` `onChange` |
+| `Counter` | 已清计数 + 去重表 | `state` `total` `reset` `add` `mark` |
+| `Me` | 自己的 mid / csrf | `mid` `ready` `token` |
 
-四个档位：`cup` 小杯 → `standard` 标准（默认）→ `kill` 杀戮，外加独立的 `atonly`。
+### L2 服务
 
-**账号名规则有意只认「肥鱼」。** 名字里只有「鲸」的账号（`小鲸`、`鲸鱼娘`）不认，
-靠正文品牌词兜底，或让用户加成自定义屏蔽词。收窄是为了压误伤面，不是漏写。
+不发请求、不碰 DOM，返回值都是纯数据。
 
-**`@` 必须真的圈到人**：`RE_AT` 要求 `@` 前面不是 `\w.+-`、后面紧跟一个像人名的字符，
-所以 `12345@qq.com`、`a@b` 这类正文里的裸 `@` 不算。
-判定 `@` 前会先剥掉 B站自动拼的「回复 @xxx :」前缀（`RE_QUOTE`），否则楼中楼会因为
-引用了机器人昵称而整片命中。
+| 模块 | 职责 |
+|---|---|
+| `Judge` | 给纯函数接上当前配置：判定上下文、自定义词正则的三态缓存 |
+| `Filter` | `payload(json, kind)` 改接口数据 + 记池子，是「数据进页面」的核心 |
+| `Candidates` | 删除 / 拉黑候选集，带版本号缓存 |
+| `CounterSink` | 计数提交，通过注入的回调触发重画 |
+| `Settings` | 改档位 / 楼中楼 / 屏蔽词的统一入口 |
+| `Lifecycle` | 首屏、换稿件 |
 
-## 四、简繁：不做文本转换
+### L3 副作用
 
-`S2T_RAW = '鱼魚鲸鯨'` —— 只有这两个字有繁体写法。`expandWord()` 把 `/鱼/` 展开成
-`/[鱼魚]/`，一条正则同时吃简繁。
+| 模块 | 职责 |
+|---|---|
+| `Net` | `rawFetch`（钩子之前的原始引用）、`postForm`、`postWithRetry`、`delReply`、`batchBlock`、`fetchSelf` |
+| `Job` | 任务执行器，`current` 生命周期完整，对外只有 `start` / `stop` / `snapshot` |
+| `Hooks` | `hookFetch` / `hookXHR` |
 
-**局限（有意接受）**：表里没收的字，自定义屏蔽词只按原字匹配。所以自定义词「测试」
-匹配不到「測試」。想让所有自定义词都繁简通吃，得把完整繁简表（约 3000 对 / 12KB）加回来，
-目前判断为不值得。
+### L4 界面 / L5 启动
 
-扩展方式：`S2T_RAW` 是 `<简><繁>` 连续拼接，一个简体有多个繁体时用 `~` 接。
+界面状态集中在 `UIState` 一个对象（三块宿主、面板节点、`tab` `actMode` `rv` `bannerSig`）。
+L5 做三件事：注入回调、装页面钩子（`pagehide` / `visibilitychange` / `Esc`）、跑首帧。
 
-## 五、计数
+## 四、拦截：评论为什么不会闪
 
-`stat = { r, s }`：`r` 一级评论，`s` 楼中楼。三条规矩：
+屏蔽发生在**接口数据层**，评论从未进入渲染队列。
 
-1. **同一个 rpid 只算一次** —— 去重表 `counted`，上限 `COUNT_CAP = 50000`
-2. **首屏清零** —— 换排序 / 换视频 / 刷新都重新算
-3. **只有真把改过的数据交给页面才记数** —— 构造响应失败就不记，避免「数字涨了评论还在」
+```
+fetch / XHR → clone 响应 → JSON.parse → Filter.payload → 改过的 JSON 塞回去
+```
 
-主楼命中时楼中楼按 `rcount`（真实条数）记，不用 `replies` 里那 2~3 条预览。
+- `hookFetch`：`res.clone()` 必须用 try 包住 —— body 已消费（302 跟随过）时 `clone()` 是**同步抛**，
+  外层 `.catch` 挂在 `then` 内部救不了，逃逸出去会让页面的 `fetch()` reject。
+- `hookXHR`：`responseText` / `response` 是只读原型属性，只能在实例上挂 getter。
+  **必须挂在 `send()` 而不是 `readystatechange`** —— 否则依赖监听器注册顺序，
+  页面比我们早注册就读到原始数据（评论没删掉，数字却涨了）。
+- 写请求走 `rawFetch`，否则会被自己的钩子拦一遍。
+- `apiKind` 认 4 种：`main` / `wbi/main` / `reply?` / `reply/reply`；`del` `add` `action` `report` 一律放行。
+- 首屏判定：新版用 `pagination_str={"offset":""}`，旧版用 `next=0` / `pn=1`。
 
-> 已知取舍：去重表满 5 万后**不再去重但继续计数**（`commitCount` 里的 `if (countedN < COUNT_CAP)`
-> 只管写入，不管累加）。原来这里是 `break`，表一满计数就永久冻住，对首页挂着不刷新的重度用户更糟。
+## 五、判定优先级
 
-## 六、评论池与候选集
+`Pure.isBlocked(reply, ctx)`，命中即返回：
 
-`pool` 是「页面已经加载出来的评论」，是删除 / 拉黑的**唯一候选来源**。
-不发额外请求、不翻页 —— 实测翻页必踩 `-352` 风控。
+| 顺序 | 规则 | 作用档位 |
+|---|---|---|
+| 1 | 账号名含「肥鱼」 | 全部 |
+| 2 | 自定义屏蔽词 | 全部 |
+| 3 | `@` | 到此为止（atonly） |
+| 4 | 品牌词（大肥鱼 / 肥鱼 / 鲸鱼 / 大肥鲸 / 鲸鱼娘 / 本鲸 / 本鱼 / 本肥鱼 / 主人） | cup 以上 |
+| 5 | `@` | 到此为止（cup） |
+| 6 | 单字 `鱼` / `鲸` | 到此为止（standard） |
+| 7 | 全角标点 / 破折号 / 直角引号 | kill |
 
-- 上限 `POOL_CAP = 20000`，满了用**环形覆盖**（`poolHead`）而不是 `Array.shift()`：
-  shift 对 2 万元素是 O(n) 搬移，而这里正落在滚动热路径上。池子因此无序，
-  但下游 `buildCandidates` / `buildBlockCandidates` 都是纯筛选，不依赖顺序。
-- `poolSeen` 是 rpid → item 的哈希索引，`poolFind()` O(1)。
-- `poolVer` 是唯一的失效版本号。凡是 pool 内容、命中标记、删除账本、自己 mid 有变化，
-  都走 `bumpPool()`。忘掉的代价从「数字过期」变成「多算一次」，方向是安全的。
-  （1.4 之前是 `hitVer++` 散在 8 处手写，改档位 / 改屏蔽词这几条路径全漏了。）
+`@` 必须真的圈到人：`RE_AT` 要求 `@` 前不是 `\w.+-`、后跟像人名的字符，
+所以 `12345@qq.com` 这类裸 `@` 不算。判 `@` 前会先剥掉 B站自动拼的「回复 @xxx :」前缀。
 
-`buildCandidates()` 排除：置顶、无 mid、**自己**（`selfMid` 没拿到时一律排除）、未命中、已删过。
-`buildBlockCandidates()` 额外排除 UP 主，并按 mid 去重到人。
+**账号名有意只认「肥鱼」**：它优先级最高（命中就不看档位），宁可窄。名字只有「鲸」的靠正文兜底。
 
-## 七、删除 / 拉黑执行器
+## 六、简繁
 
-`job` 同一时刻只跑一个，随时可停，停止检查在**两条之间**。
+不做文本转换，把字扩成字符类：`/鱼/` → `/[鱼魚]/`。`S2T_RAW = '鱼魚鲸鯨'`，
+只收真有繁体写法的字，编码 `<简><繁>`，多繁体用 `~` 接。
+
+**局限**：表里没有的字，自定义词只按原字匹配。所以输入简体「测试」不会被繁体「測試」命中；反向也不会。
+
+## 七、状态设计要点
+
+**`Pool.ver()` 是唯一失效版本号。** 池子内容、命中标记、账本、自己 mid 任何变化都走 `bump()`。
+缓存忘失效的代价从「数字过期」变成「多算一次」，方向安全。
+
+**池满用环形覆盖而非 shift**：shift 对 2 万元素是 O(n) 搬移，而这在滚动热路径上。池子因此无序，但下游候选集都是纯筛选。
+
+**`Page.gen()` 稿件代数。** 每次首屏加一，任务在点确认时记下代数并按此比对。比 oid 可靠 —— 切到评论区为空的稿件时，新页面根本没有 oid 可比。
+
+**账本攒批落盘。** `markDeleted` / `addMids` 只改内存 + 置 dirty，由 `flush` 合并成一次写
+（任务收尾、`pagehide`、`visibilitychange`）。瘦身按「本次会话写入顺序」淘汰，均摊 O(1)；
+只有账本刚从盘里读出来、还没有顺序表时才整表排序重建。
+
+## 八、执行器
+
+一次只跑一个任务，随时可停，停止检查在两条之间。
 
 | 参数 | 值 |
 |---|---|
-| `DEL_GAP` | 350ms（两条删除之间） |
-| `BLOCK_GAP` | 260ms（两批拉黑之间） |
-| `RETRY_MAX` | 3（只对 `-509` 生效） |
-| `DEL_START_DELAY` | 500ms（点确认后等一拍，给「刚点完就切页」留拦截窗口） |
+| `delGap` | 350ms |
+| `blockGap` | 260ms |
+| `retryMax` | 3（只对 `-509`） |
+| `blockBatch` | 50 人 / 批 |
+| 确认后延迟 | 500ms |
 
-拉黑走批量接口 `/x/relation/batch/modify`，一次最多 50 人 —— 请求数从 N 降到 N/50。
+**`-352` 不重试**：风控黑名单级别，重试间隔会让 100 条的目标空转十几分钟。
+**`pump` 必须 try/finally**：中途抛异常会让 `j.running` 永远为 true，之后 `start` 的守卫一直返回这个僵尸 job。
 
-**`-352` 不重试，直接收工。** 它是风控黑名单级别，几乎不可能在一次任务里恢复；
-4s/8s/12s 退避会让 100 条的目标耗掉 40 分钟，界面只剩进度条空转，还多烧风控额度。
-`-101` / `-111` / `-403` 同理立刻停，重试也没用。
+## 九、容量
 
-**`pumpJob` 用 try/finally 收尾。** 不管正常结束、异常还是被 stop 都必须走到 `finishJob`，
-否则 `j.running` 永远停在 `true`，`startJob` 的守卫会一直返回这个僵尸 job，
-整个删除 / 拉黑功能在本次页面生命周期里就废了，只能刷新页面。
-
-**跨稿件守卫**：任务每发一个请求都比对 `currentOid`，切走就中断。
-用户点完确认后完全可能马上切视频，而任务手里的 list 还是旧 pool 的元素引用。
-
-## 八、本地账本
-
-`dafeiyu.book.v1`，两个表分开算：
-
-| 表 | 内容 | 上限 | 理由 |
-|---|---|---|---|
-| `m` 拉黑表 | `{mid: {n 名字, t 时间}}` | 3000 | 用户会回头查，留名字 |
-| `r` 删除表 | `{rpid: 时间}` | 20000 | 只用来判「删过没有」，和 `POOL_CAP` 对齐 |
-
-原来两张表共用一个 3000 的上限，和 5000 的池子对不上：池子能装 5000，账本只记得 3000，
-中间那批删完刷新就被忘了，会重新进候选再删一遍。
-
-**写盘是攒批的**：`markDeleted` / `addBook` 只改内存 + 置 `bookDirty`，
-由 `flushBook()` 合并成一次落盘（任务收尾、`pagehide`、`beforeunload`、`visibilitychange` hidden）。
-按条写的话，批量删 1000 条就是 1000 次全量 `JSON.stringify` + 同步 storage 写入。
-
-`loadBook()` 会**逐个清洗**：`{m:{111:null}}` 这种脏条目直接改成 `{n:'',t:0}`。
-不清的话 `pruneBook` 读 `.t` 就抛 TypeError，而它在 `flushBook` 里 ——
-抛出去会把拉黑任务的收尾一起带崩。
-
-## 九、界面
-
-三块 Shadow DOM，互不影响：
-
-| 宿主 | 位置 | 说明 |
+| 常量 | 值 | 理由 |
 |---|---|---|
-| `host` | 右上角浮层 | 主面板，「屏蔽设置」/「删除 / 拉黑」两个页签**原地切换** |
-| `subHost` | 同上 | 二级页：自定义屏蔽词 |
-| `bHost` | 评论区顶部 `#feed` 前 | 横幅，「已清 N 条」+ 右侧一串 |
-
-**横幅右侧默认收起。** `config.showActs` 控制那一串（误判提醒 + 删除 / 拉黑按钮）
-露不露，默认 `false`：这行字天天挂在评论区顶上比弹窗还显眼，而删除 / 拉黑是低频操作。
-开关在「删除 / 拉黑」页里。收起用 `display:none` 而不是摘节点 ——
-摘掉再插回来要重新走 Shadow DOM 布局，而且 `bDel` / `bBlk` 的置灰状态、签名守卫都还依赖这些节点。
-
-**横幅挂载点**：优先 `#commentapp bili-comments` 的 shadow 里 `#feed` 之前，
-退路是 `.reply-warp` / `.reply-list`，个人空间兜底 `.bili-dyn-list`。
-B站重建 `#feed` 时会把横幅一起摘掉，所以有两条重挂路径：
-`watchMount()`（300ms × 50 次短窗口）+ `watchDog()`（2 秒一次的常驻兜底）。
-
-`updateBannerText()` 用签名守卫：计数、候选数、两个开关、登录态、主题任一变化才碰 DOM；
-并且**先把 `document.cookie` 读完再写 DOM** —— 反过来会强制一次同步样式重算（实测 3.7us → 17.3us）。
+| `POOL_CAP` | 20000 | 候选集能回溯多远，约 9.8MB 堆 |
+| `BOOK_DEL_CAP` | 20000 | 删除表必须 ≥ 池子，否则删满一池刷新后会重复处理 |
+| `BOOK_MID_CAP` | 3000 | 拉黑表存名字，用户会回头查 |
+| `COUNT_CAP` | 50000 | 计数去重表 |
+| `MAX_WORDS` | 100 | 自定义词个数 |
+| `MAX_LEN` | 24 | 单个词字数 |
 
 ## 十、配置
 
-键 `dafeiyu.config.v2`（键名从 1.2 起没变，老用户的档位 / 屏蔽词无缝升级）：
+键 `dafeiyu.config.v2`（从 1.2 起没变，老用户无缝升级），账本键 `dafeiyu.book.v1`。
 
 ```js
 {
   tier: 'standard',   // cup | standard | kill | atonly
   sub: 'only',        // only | whole | none
   showCount: true,    // 评论区顶部显示「已清 N 条」
-  showActs: false,    // 横幅右侧那一串（误判提醒 + 删除 / 拉黑按钮）
-  words: []           // 自定义屏蔽词，最多 100 个，每个 24 字
+  showActs: false,    // 横幅右侧（误判提醒 + 删除 / 拉黑按钮）
+  words: []           // 自定义屏蔽词
 }
 ```
 
-**读取时必须用 `hasOwnProperty` 查白名单。** 普通对象字面量继承 `Object.prototype`，
-`VALID_TIER['constructor']` 是真值 —— 配置里 tier 写成 `'constructor'` 会通过校验，
-而 `isBlocked` 里所有档位分支都落空，用户会莫名其妙发现「屏蔽强度自己变严了」。
+**白名单必须用 `hasOwnProperty`**：普通对象继承 `Object.prototype`，
+`VALID_TIER['constructor']` 是真值 —— tier 写成 `'constructor'` 会通过校验，而所有档位分支都落空。
 
-## 十一、测试
+## 十一、界面要点
+
+三块 Shadow DOM 互不影响：`host`（主面板）、`subHost`（屏蔽词二级页）、`bHost`（横幅）。
+
+- **横幅右侧默认收起**（`showActs`）。收起用 `display:none` 而非摘节点 —— 摘了再插要重走 Shadow DOM 布局，
+  而且 `bDel` / `bBlk` 的置灰状态、签名守卫还引用着它们。
+- **`updateBannerText` 签名守卫**：计数 / 候选数 / 两个开关 / 登录态 / 主题全没变就一个 DOM 都不碰。
+  并且先把 `document.cookie` 读完再写 DOM —— 反过来会强制一次同步样式重算（约 3.7us → 17us）。
+- **横幅频繁被摘**：B站重建 `#feed` 会连横幅一起摘掉，所以有 `watchMount`（300ms × 50）和 `watchDog`（2 秒常驻）两条重挂路径。
+- 深色主题类必须加在 shadow 内部的 `.dfy-b` 上，加在宿主上选择器匹配不到。
+
+## 十二、测试
 
 ```sh
-sh tests/run-all.sh        # 全部
-node tests/tabs.js         # 单个
+sh tests/run-all.sh
 ```
 
 | 文件 | 覆盖 |
 |---|---|
-| `regress2.js` | 判定规则、过滤、计数、候选集、池子环形缓冲、脏配置 |
-| `jobflow.js` | 删除 / 拉黑任务的完整生命周期 |
-| `edge.js` | 脏账本、脏配置、写盘失败、畸形接口数据 |
-| `tabs.js` | 两个页签原地切换、面板结构 |
-| `banner2.js` / `banneracts.js` / `remount.js` | 横幅显隐、右侧开关、被 B站摘掉后重新挂上 |
-| `hooks.js` | `apiKind` / `isFirstPageReq` 对三种入参 |
-| `persist.js` | 删除账本跨刷新仍然生效 |
-| `retry.js` | `-509` 退避重试、`-352` 立刻停 |
-| `countcap.js` / `caps.js` | 计数上限、各容量上限之间的一致性 |
-| `bench.js` | 性能基线（不是用例，改动前后对比用） |
+| `regress2.js` | 判定、过滤、计数、候选集、环形缓冲、脏配置 |
+| `refactor15.js` | 分层约束（Pure 不碰 DOM/storage、无 console、版本号）+ 各层联通 |
+| `jobflow.js` | 任务完整生命周期 |
+| `edge.js` | 脏账本、脏配置、写盘失败、畸形数据 |
+| `tabs.js` `banner2.js` `banneracts.js` `remount.js` | 页签、横幅显隐、右侧开关、重挂 |
+| `hooks.js` `persist.js` `retry.js` `countcap.js` `caps.js` | 钩子、账本持久化、重试、上限 |
 
-`tests/probe.js` 会被注入到 IIFE 尾部，把内部函数挂到 `W.__t` 上 —— 用例直接调真函数，
-不是另写一份逻辑。新增用例需要新内部函数时，在这里加一行。
+`tests/probe.js` 注入到 IIFE 尾部，把内部函数挂到 `W.__t`，用例直接调真函数。新增用例需要新内部函数时在这里加一行。
 
-> 假 DOM 不是真浏览器：布局、样式重算、Shadow DOM 的真实行为都测不到，这几项只能人肉在真页面上看。
+> 假 DOM 不是真浏览器：布局、样式重算、Shadow DOM 的真实行为测不到，只能人肉看。
 
-## 十二、改代码时容易踩的坑
+## 十三、改代码容易踩的坑
 
-1. **转义顺序**：`buildWordsRe` 必须先对原始词做正则转义、再做繁体展开。
-   反了的话展开出来的 `[ ]` 会被当成元字符转义掉。
-2. **首屏顺序**：`onFirstPage()` 必须在 `filterPayload()` **之前**跑。
-   反了会把刚记录进去的评论一起清掉，候选数和计数永远是 0。
-3. **环形游标要归零**：`onFirstPage` 里 `poolHead = 0` 不能漏。
-   漏了会出现「slot 落在本轮没写过的槽位」，把 `poolSeen` 里还在用的索引删掉。
-4. **整页全过滤后要标 `is_end`**：`data.replies` 变成空数组但 `cursor` 还写着「后面还有」，
-   B站前端有些路径用 `replies.length === 0` 判断没数据就停止加载，用户会看到空评论区还翻不了页。
-   只标 `is_end`，**不要动 `next`** —— 改 next 会破坏 B站自己的翻页偏移。
-5. **置顶要单独建集合**：`top_replies` 和 `top.upper` 是两份，而且置顶评论会**重复出现在 `replies` 里**。
-6. **加新的 `@grant` 要同时改 `HAS_GM` 那条分支**，否则回落到 localStorage 的路径会静默失效。
-7. **改容量常量要同步跑 `tests/caps.js`**：池子和删除账本脱钩会导致「删完刷新又冒出来」。
+1. **转义顺序**：`buildWordsRe` 必须先转义再繁体展开，反了会把展开出的 `[ ]` 转义掉。
+2. **首屏顺序**：`Lifecycle.onFirstPage()` 必须在 `Filter.payload()` 之前跑，反了候选数和计数永远是 0。
+3. **环形游标归零**：`Pool.reset()` 里 head 要归零，否则游标会落在本轮没写过的槽位，把 seen 里还在用的索引删掉。
+4. **整页滤空要标 is_end**：只标 `is_end`，**不要动 `next`** —— 改 next 会破坏 B站自己的翻页偏移。
+5. **置顶要跨页持久**：`top_replies` 只在第一页有，置顶评论会重复出现在 `replies` 里，集合必须挂在 `Page` 上。
+6. **改容量常量同步跑 `caps.js`**：删除表比池子小会导致「删完刷新又冒出来」。
+7. **加 `@grant` 要同时改 `Store` 的分支**，否则会静默回落到 localStorage。
+8. **不要在 L0–L3 里碰 DOM**，也不要在 L2 里直接调 L4 —— 用 `onChange` 注入。
