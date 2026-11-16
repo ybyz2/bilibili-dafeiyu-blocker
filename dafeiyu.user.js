@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         屏蔽大肥鱼
 // @namespace    dafeiyu
-// @version      1.6.0
+// @version      1.6.1
 // @description  屏蔽B站评论区里的大肥鱼（简繁通吃），并可批量删除 / 拉黑
 // @match        https://www.bilibili.com/*
 // @match        https://t.bilibili.com/*
