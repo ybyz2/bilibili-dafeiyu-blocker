@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         屏蔽大肥鱼
 // @namespace    dafeiyu
-// @version      1.5.0
+// @version      1.6.0
 // @description  屏蔽B站评论区里的大肥鱼（简繁通吃），并可批量删除 / 拉黑
 // @match        https://www.bilibili.com/*
 // @match        https://t.bilibili.com/*
@@ -70,8 +70,9 @@
     var BLOCK_BATCH = 50;
 
     var LIMITS = {
-      words: 100,         /* 自定义屏蔽词个数上限 */
-      wordLen: 24,        /* 单个屏蔽词字数上限 */
+      words: 1000,        /* 自定义屏蔽词个数上限 */
+      names: 1000,        /* 自定义屏蔽用户名个数上限 */
+      wordLen: 24,        /* 单个条目字数上限（词与用户名共用） */
       countTrack: 50000,  /* 计数去重表上限 */
       errs: 20            /* 任务失败明细最多留几条 */
     };
@@ -99,7 +100,7 @@
     var VALID_SUB  = { only: 1, whole: 1, none: 1 };
 
     var DEFAULT_CONFIG = {
-      tier: 'standard', sub: 'only', showCount: true, showActs: false, words: []
+      tier: 'standard', sub: 'only', showCount: true, showActs: false, words: [], names: []
     };
 
     function hasOwn(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
@@ -237,25 +238,30 @@
     }
 
     /*
-     * 唯一的判定入口。ctx 只传两样东西：
-     *   tier    当前档位
-     *   custom  自定义屏蔽词正则（null = 没有词 / 构建失败）
+     * 唯一的判定入口。ctx 传三样东西：
+     *   tier       当前档位
+     *   custom     自定义屏蔽词正则（null = 没有词 / 构建失败）
+     *   customName 自定义屏蔽用户名正则（同上）
      *
      * 优先级从上到下，命中即返回：
-     *   1 账号名含「肥鱼」（所有档位）  2 自定义屏蔽词（所有档位）
-     *   3 只屏蔽 @ 档到此为止           4 品牌词
-     *   5 小杯档到此为止                6 @ 到人
-     *   7 标准档到此为止                8 单字鱼 / 鲸
-     *   9 全角标点 / 破折号 / 直角引号
+     *   0 自定义用户名 / 账号名含「肥鱼」（只看名字，不参与档位取舍）
+     *   1 自定义屏蔽词（所有档位）      2 只屏蔽 @ 档到此为止
+     *   3 品牌词                        4 小杯档到此为止
+     *   5 @ 到人                        6 标准档到此为止
+     *   7 单字鱼 / 鲸                   8 全角标点 / 破折号 / 直角引号
      */
     function isBlocked(r, ctx) {
       var full = textOf(r);
       var body = stripQuotePrefix(full);
       var m;
 
-      /* 账号名含「肥鱼」：所有档位一律屏蔽，这条精度最高，不参与档位取舍 */
+      /* 账号名判定：自定义用户名 + 内置「肥鱼」。只看名字，不参与档位取舍 */
       m = r && r.member;
-      if (m && RE_NAME.test(m.uname || m.name || '')) return true;
+      var uname = (m && (m.uname || m.name)) || '';
+      if (uname) {
+        if (ctx.customName && ctx.customName.test(uname)) return true;
+        if (RE_NAME.test(uname)) return true;
+      }
 
       /* 自定义屏蔽词：所有档位都生效 */
       if (ctx.custom && ctx.custom.test(full)) return true;
@@ -371,10 +377,11 @@
     /* ---------- 数据整形 ---------- */
 
     /* ['a', null, 1, '  ok  ', 'OK', ''] -> ['ok']，去空、去重、截断 */
-    function cleanWords(raw) {
+    function cleanWords(raw, cap) {
       var out = [], seen = Object.create(null), i, w, lw;
       if (!Array.isArray(raw)) return out;
-      for (i = 0; i < raw.length && out.length < LIMITS.words; i++) {
+      if (!cap) cap = LIMITS.words;
+      for (i = 0; i < raw.length && out.length < cap; i++) {
         w = raw[i];
         if (typeof w !== 'string') continue;
         w = w.replace(/^\s+|\s+$/g, '').slice(0, LIMITS.wordLen);
@@ -395,22 +402,26 @@
      */
     function normalizeConfig(o) {
       var cfg = { tier: DEFAULT_CONFIG.tier, sub: DEFAULT_CONFIG.sub,
-                  showCount: DEFAULT_CONFIG.showCount, showActs: DEFAULT_CONFIG.showActs, words: [] };
+                  showCount: DEFAULT_CONFIG.showCount, showActs: DEFAULT_CONFIG.showActs,
+                  words: [], names: [] };
       if (!o || typeof o !== 'object') return cfg;
       if (typeof o.tier === 'string' && hasOwn(VALID_TIER, o.tier)) cfg.tier = o.tier;
       if (typeof o.sub === 'string' && hasOwn(VALID_SUB, o.sub)) cfg.sub = o.sub;
       if (typeof o.showCount === 'boolean') cfg.showCount = o.showCount;
       if (typeof o.showActs === 'boolean') cfg.showActs = o.showActs;
-      if (Array.isArray(o.words) && o.words.length) cfg.words = cleanWords(o.words);
+      if (Array.isArray(o.words) && o.words.length) cfg.words = cleanWords(o.words, LIMITS.words);
+      if (Array.isArray(o.names) && o.names.length) cfg.names = cleanWords(o.names, LIMITS.names);
       return cfg;
     }
 
-    /* 新增屏蔽词只做「能不能加」的判断，不改任何状态 */
-    function validateWord(raw, existing) {
+    /* 新增条目只做「能不能加」的判断，不改任何状态。cap / unit 让词和用户名共用一套规则 */
+    function validateWord(raw, existing, cap, unit) {
       var w = (raw == null ? '' : String(raw)).replace(/^\s+|\s+$/g, '').replace(/\s+/g, ' ');
-      if (!w) return { ok: false, msg: '词不能为空' };
+      if (!w) return { ok: false, msg: (unit || '词') + '不能为空' };
       if (w.length > LIMITS.wordLen) return { ok: false, msg: '最多 ' + LIMITS.wordLen + ' 个字' };
-      if (existing.length >= LIMITS.words) return { ok: false, msg: '最多 ' + LIMITS.words + ' 个词' };
+      if (existing.length >= (cap || LIMITS.words)) {
+        return { ok: false, msg: '最多 ' + (cap || LIMITS.words) + ' 个' + (unit || '词') };
+      }
       for (var i = 0; i < existing.length; i++) {
         if (existing[i].toLowerCase() === w.toLowerCase()) return { ok: false, msg: '这个已经有了' };
       }
@@ -630,10 +641,21 @@
       if (patch.showCount !== undefined) cfg.showCount = patch.showCount;
       if (patch.showActs !== undefined) cfg.showActs = patch.showActs;
       if (patch.words !== undefined) cfg.words = patch.words;
+      if (patch.names !== undefined) cfg.names = patch.names;
       return cfg;
     }
 
     function save() { return Store.writeConf(cfg); }
+
+    /* 回读比对一组字符串，对不上就返回失败原因 */
+    function compareList(back, mine, label) {
+      var bw = back || [];
+      if (bw.length !== mine.length) return { ok: false, msg: '保存失败，' + label + '数量对不上' };
+      for (var i = 0; i < mine.length; i++) {
+        if (bw[i] !== mine[i]) return { ok: false, msg: '保存失败，' + label + '没存全' };
+      }
+      return null;
+    }
 
     /*
      * 保存 = 写盘 + 回读校验。
@@ -652,11 +674,10 @@
       if ((back.showCount ? 1 : 0) !== (cfg.showCount ? 1 : 0)) return { ok: false, msg: '保存失败，开关没有存住' };
       if ((back.showActs ? 1 : 0) !== (cfg.showActs ? 1 : 0)) return { ok: false, msg: '保存失败，按钮开关没有存住' };
 
-      var bw = back.words || [];
-      if (bw.length !== cfg.words.length) return { ok: false, msg: '保存失败，屏蔽词数量对不上' };
-      for (var i = 0; i < cfg.words.length; i++) {
-        if (bw[i] !== cfg.words[i]) return { ok: false, msg: '保存失败，屏蔽词没存全' };
-      }
+      var bad = compareList(back.words, cfg.words, '屏蔽词');
+      if (bad) return bad;
+      bad = compareList(back.names, cfg.names, '屏蔽用户名');
+      if (bad) return bad;
       return { ok: true };
     }
 
@@ -669,6 +690,7 @@
       showCount: function () { return cfg.showCount; },
       showActs: function () { return cfg.showActs; },
       words: function () { return cfg.words; },
+      names: function () { return cfg.names; },
       /* 内部对象只读视图。测试用例直接改它来模拟「用户点了某个档位」，
          生产代码一律走上面的查询方法 + set()。 */
       raw: function () { return cfg; }
@@ -1199,6 +1221,7 @@
      * 词一变就 invalidate()，下次判定时重建。
      */
     var cache;
+    var nameCache;
 
     function re() {
       if (cache !== undefined) return cache;
@@ -1207,7 +1230,15 @@
       return cache;
     }
 
-    function invalidate() { cache = undefined; }
+    /* 自定义屏蔽用户名。和词同构，只是拿名字而不是正文去匹配。 */
+    function namesRe() {
+      if (nameCache !== undefined) return nameCache;
+      var names = Config.names();
+      nameCache = names.length ? Pure.buildWordsRe(names) : null;
+      return nameCache;
+    }
+
+    function invalidate() { cache = undefined; nameCache = undefined; }
 
     /*
      * 判定上下文。
@@ -1224,8 +1255,9 @@
 
     function ctxFor(tier) {
       var c = ctxByTier[tier];
-      if (!c) c = ctxByTier[tier] = { tier: tier, custom: null };
+      if (!c) c = ctxByTier[tier] = { tier: tier, custom: null, customName: null };
       c.custom = re();
+      c.customName = namesRe();
       return c;
     }
 
@@ -1620,7 +1652,7 @@
 
     /* 加 / 删自定义词。返回 { ok, word? , msg? } */
     function addWord(raw) {
-      var r = Pure.validateWord(raw, Config.words());
+      var r = Pure.validateWord(raw, Config.words(), Pure.LIMITS.words, '词');
       if (!r.ok) return r;
       Config.words().push(r.word);
       wordsDirty();
@@ -1635,6 +1667,23 @@
       return false;
     }
 
+    /* 加 / 删自定义屏蔽用户名。和词同一套规则，只是作用在账号名上 */
+    function addName(raw) {
+      var r = Pure.validateWord(raw, Config.names(), Pure.LIMITS.names, '用户名');
+      if (!r.ok) return r;
+      Config.names().push(r.word);
+      wordsDirty();
+      return r;
+    }
+
+    function removeName(n) {
+      var ns = Config.names();
+      for (var i = 0; i < ns.length; i++) {
+        if (ns[i] === n) { ns.splice(i, 1); wordsDirty(); return true; }
+      }
+      return false;
+    }
+
     return {
       bind: bind,
       apply: apply,
@@ -1644,7 +1693,9 @@
       setShowCount: setShowCount,
       setShowActs: setShowActs,
       addWord: addWord,
-      removeWord: removeWord
+      removeWord: removeWord,
+      addName: addName,
+      removeName: removeName
     };
   })();
 
@@ -2281,6 +2332,7 @@
     /* 三块宿主的节点引用，建过才有 */
     host: null, panel: null, bodyEl: null, navEl: null, swEl: null,
     subHost: null, subPanel: null, listEl: null, inputEl: null,
+    nameListEl: null, nameInputEl: null,
     toastHost: null, toastEl: null, toastTimer: 0,
     bHost: null, bBar: null, bDel: null, bBlk: null, bName: null, bWarn: null, bActs: null,
     /* 「删除 / 拉黑」页 */
@@ -2474,33 +2526,29 @@
     var sh = UIState.subHost.attachShadow({ mode: 'open' });
     ensureStyleIn(sh);
 
-    UIState.subPanel = el('div', 'p2 t');
+    UIState.subPanel = el('div', 'p t');   /* 用 .p 拿定位；.p2 从来没在 CSS 里定义过 */
     applyTheme(UIState.subPanel);
     UIState.subPanel.appendChild(header(function () { closeSub(true); }));
 
+    /* ---- 第一组：自定义屏蔽词 ---- */
     UIState.subPanel.appendChild(el('div', 'g', '自定义屏蔽词'));
-
     UIState.listEl = el('div', 'ws');
     UIState.subPanel.appendChild(UIState.listEl);
-
-    var row = el('div', 'r');
-    UIState.inputEl = el('input', 'in');
-    UIState.inputEl.type = 'text';
-    UIState.inputEl.maxLength = Pure.LIMITS.wordLen;
-    UIState.inputEl.placeholder = '输入一个词，回车添加';
-    UIState.inputEl.onkeydown = function (e) {
-      if (e.keyCode === 13 || e.key === 'Enter') { e.preventDefault(); commitInput(); }
-    };
-    row.appendChild(UIState.inputEl);
-
-    var add = el('div', 'btn', '确定');
-    add.onclick = commitInput;
-    row.appendChild(add);
-    UIState.subPanel.appendChild(row);
-
+    UIState.inputEl = buildInputRow('输入一个词，回车添加', commitInput);
+    UIState.subPanel.appendChild(UIState.inputEl.row);
     UIState.subPanel.appendChild(el('div', 'tip',
       '命中任意一个词就屏蔽（不分大小写，包含即命中），简体和繁体都会命中。所有档位都生效，' +
       Pure.LIMITS.words + ' 个词以内。'));
+
+    /* ---- 第二组：自定义屏蔽用户名 ---- */
+    UIState.subPanel.appendChild(el('div', 'g', '自定义屏蔽用户名'));
+    UIState.nameListEl = el('div', 'ws');
+    UIState.subPanel.appendChild(UIState.nameListEl);
+    UIState.nameInputEl = buildInputRow('输入一个用户名，回车添加', commitNameInput);
+    UIState.subPanel.appendChild(UIState.nameInputEl.row);
+    UIState.subPanel.appendChild(el('div', 'tip',
+      '账号名包含任意一个就屏蔽（不分大小写，包含即命中），所有档位都生效，' +
+      Pure.LIMITS.names + ' 个以内。和上面的屏蔽词一样，只看名字不看内容。'));
 
     var foot = el('div', 'f');
     var ok = el('div', 'btn pri', '保存');
@@ -2510,6 +2558,27 @@
 
     sh.appendChild(UIState.subPanel);
     (document.body || document.documentElement).appendChild(UIState.subHost);
+  }
+
+  /*
+   * 一组「输入框 + 确定」。词和用户名两组结构完全一样，抽出来免得抄两遍。
+   * 返回 { row, input }，回车和点确定都走同一个 onSubmit。
+   */
+  function buildInputRow(placeholder, onSubmit) {
+    var row = el('div', 'r');
+    var input = el('input', 'in');
+    input.type = 'text';
+    input.maxLength = Pure.LIMITS.wordLen;
+    input.placeholder = placeholder;
+    input.onkeydown = function (e) {
+      if (e.keyCode === 13 || e.key === 'Enter') { e.preventDefault(); onSubmit(); }
+    };
+    row.appendChild(input);
+
+    var add = el('div', 'btn', '确定');
+    add.onclick = onSubmit;
+    row.appendChild(add);
+    return { row: row, input: input };
   }
 
   function commitInput() {
@@ -2522,14 +2591,26 @@
     inputEl.focus();
   }
 
+  function commitNameInput() {
+    var inputEl = UIState.nameInputEl;
+    if (!inputEl) return;
+    var r = Settings.addName(inputEl.value);
+    if (!r.ok) { toast(r.msg, UIState.subPanel); return; }
+    inputEl.value = '';
+    drawNames();
+    inputEl.focus();
+  }
+
   function openSub() {
     buildSub();
     applyTheme(UIState.subPanel);
     reattach(UIState.subHost);
     drawWords();
+    drawNames();
     if (UIState.host) UIState.host.style.display = 'none';
     UIState.subHost.style.display = 'block';
-    syncFade();
+    syncFade(UIState.listEl);
+    syncFade(UIState.nameListEl);
     if (UIState.inputEl) { try { UIState.inputEl.focus(); } catch (e) {} }
   }
 
@@ -2544,32 +2625,39 @@
   }
 
   function drawWords() {
-    var listEl = UIState.listEl;
-    if (!listEl) return;
-    while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
-    var dk = isDark(), words = Config.words();
-    for (var i = 0; i < words.length; i++) {
-      listEl.appendChild(makeBubble(words[i], dk));
-    }
-    syncFade();
+    fillList(UIState.listEl, Config.words(), false);
   }
 
-  function syncFade() {
-    var listEl = UIState.listEl;
+  function drawNames() {
+    fillList(UIState.nameListEl, Config.names(), true);
+  }
+
+  /* 把一组条目画成气泡。isName 决定删的时候走哪个 Setting。 */
+  function fillList(listEl, items, isName) {
+    if (!listEl) return;
+    while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+    var dk = isDark();
+    for (var i = 0; i < items.length; i++) {
+      listEl.appendChild(makeBubble(items[i], dk, isName));
+    }
+    syncFade(listEl);
+  }
+
+  function syncFade(listEl) {
     if (!listEl) return;
     try {
       listEl.classList.toggle('more', listEl.scrollHeight > listEl.clientHeight + 1);
     } catch (e) {}
   }
 
-  function makeBubble(w, dk) {
+  function makeBubble(w, dk, isName) {
     var b = el('div', 'w' + (dk ? ' dk' : ''));
     b.appendChild(el('span', null, w));
     var x = el('i', null, '×');
     x.title = '删除';
     x.onclick = function () {
-      Settings.removeWord(w);
-      drawWords();
+      if (isName) { Settings.removeName(w); drawNames(); }
+      else { Settings.removeWord(w); drawWords(); }
     };
     b.appendChild(x);
     return b;
