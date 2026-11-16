@@ -2534,8 +2534,9 @@
     UIState.subPanel.appendChild(el('div', 'g', '自定义屏蔽词'));
     UIState.listEl = el('div', 'ws');
     UIState.subPanel.appendChild(UIState.listEl);
-    UIState.inputEl = buildInputRow('输入一个词，回车添加', commitInput);
-    UIState.subPanel.appendChild(UIState.inputEl.row);
+    var row1 = buildInputRow('输入一个词，回车添加', commitInput);
+    UIState.inputEl = row1.input;
+    UIState.subPanel.appendChild(row1.row);
     UIState.subPanel.appendChild(el('div', 'tip',
       '命中任意一个词就屏蔽（不分大小写，包含即命中），简体和繁体都会命中。所有档位都生效，' +
       Pure.LIMITS.words + ' 个词以内。'));
@@ -2544,8 +2545,9 @@
     UIState.subPanel.appendChild(el('div', 'g', '自定义屏蔽用户名'));
     UIState.nameListEl = el('div', 'ws');
     UIState.subPanel.appendChild(UIState.nameListEl);
-    UIState.nameInputEl = buildInputRow('输入一个用户名，回车添加', commitNameInput);
-    UIState.subPanel.appendChild(UIState.nameInputEl.row);
+    var row2 = buildInputRow('输入一个用户名，回车添加', commitNameInput);
+    UIState.nameInputEl = row2.input;
+    UIState.subPanel.appendChild(row2.row);
     UIState.subPanel.appendChild(el('div', 'tip',
       '账号名包含任意一个就屏蔽（不分大小写，包含即命中），所有档位都生效，' +
       Pure.LIMITS.names + ' 个以内。和上面的屏蔽词一样，只看名字不看内容。'));
@@ -3446,6 +3448,8 @@
     closePanel: closePanel,
     openSub: openSub,
     closeSub: closeSub,
+    commitInput: commitInput,
+    commitNameInput: commitNameInput,
     openOp: openOp,
     closeOp: closeOp,
     showTab: showTab,
